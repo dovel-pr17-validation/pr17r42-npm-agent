@@ -1,0 +1,6118 @@
+import { describe, expect, test, vi } from "vitest";
+import { z } from "zod";
+import {
+  createActor,
+  createAsyncLogic,
+  setup,
+  toPromise,
+  type AnyMachineSnapshot,
+  type Snapshot,
+} from "xstate";
+import { createDecisionLogic } from "./decision.js";
+import {
+  AGENT_TRACE_SCHEMA_VERSION,
+  AGENT_USAGE_EVENT_TYPE,
+  AgentError,
+  AgentEventLogConflictError,
+  AgentMachineVersionMismatchError,
+  AgentSnapshotDivergedError,
+  createAgentSchemas,
+  createTextLogic,
+  AgentInvalidEventPayloadError,
+  parseAgentEvent,
+  inspectTransitions,
+  isAgentIdle,
+  createAgentRuntime,
+  runAgent,
+  runToQuiescence,
+  serializeTraceEvent,
+  setupAgent,
+  type AgentDecisionRequest,
+  type AgentRequestExecutorResult,
+  type AgentEventLogStore,
+  type AgentLogEntry,
+  type AgentTextRequest,
+  type AgentTools,
+  type AgentTraceEvent,
+  type ChosenEvent,
+} from "./index.js";
+import {
+  AGENT_INIT_EVENT_TYPE,
+  forkEventLog,
+  getLogExecutionId,
+  getUsageFromEvents,
+  replay,
+  createInMemoryEventLogStore,
+} from "./log/index.js";
+import { getMachineStructuralHash } from "./index.js";
+
+/**
+ * A promise plus its resolver. Tests drive a run's timing off these instead of
+ * wall-clock sleeps, so a slow machine cannot turn a race into a flake.
+ */
+function deferred<T = void>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((settle) => {
+    resolve = settle;
+  });
+  return { promise, resolve };
+}
+
+describe("runAgent", () => {
+  test("done path: completes with typed output from a TextLogic invoke", async () => {
+    const schemas = createAgentSchemas({
+      context: z.object({ prompt: z.string(), answer: z.string().nullable() }),
+      input: z.object({ prompt: z.string() }),
+      output: z.object({ answer: z.string() }),
+    });
+
+    const answerQuestion = createTextLogic({
+      schemas: {
+        input: z.object({ prompt: z.string() }),
+        output: z.object({ answer: z.string() }),
+      },
+      model: "test-model",
+      prompt: ({ input }) => input.prompt,
+    });
+
+    const agent = setupAgent({ schemas, actors: { answerQuestion } });
+    const machine = agent.createMachine({
+      context: ({ input }) => ({ prompt: input.prompt, answer: null }),
+      initial: "answering",
+      states: {
+        answering: {
+          invoke: {
+            id: "answer",
+            src: "answerQuestion",
+            input: ({ context }) => ({ prompt: context.prompt }),
+            onDone: ({ output }) => ({
+              target: "done",
+              context: { answer: output.result.answer },
+            }),
+          },
+        },
+        done: {
+          type: "final",
+          output: ({ context }) => ({ answer: context.answer ?? "" }),
+        },
+      },
+    });
+
+    const generateText = async (request: AgentTextRequest & { tools: AgentTools }) => ({
+      result: { answer: `Answered: ${request.prompt}` },
+    });
+
+    const observedEvents: string[] = [];
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText,
+        },
+        onTransition: (_snapshot, event) => observedEvents.push(event.type),
+      }),
+      {
+        input: { prompt: "why state machines?" },
+      },
+    );
+
+    expect(result.status).toBe("done");
+    expect(result.status === "done" ? result.output : undefined).toEqual({
+      answer: "Answered: why state machines?",
+    });
+    expect(observedEvents).toContain("@xstate.init");
+    expect(observedEvents).toContain("xstate.done.actor");
+  });
+
+  test("idle + resume: settles idle waiting for an event, then completes on resume", async () => {
+    const schemas = createAgentSchemas({
+      context: z.object({ prompt: z.string(), draft: z.string().nullable() }),
+      input: z.object({ prompt: z.string() }),
+      output: z.object({ draft: z.string() }),
+      events: { APPROVE: z.object({}) },
+    });
+
+    const draftText = createTextLogic({
+      schemas: {
+        input: z.object({ prompt: z.string() }),
+        output: z.string(),
+      },
+      model: "test-model",
+      prompt: ({ input }) => input.prompt,
+    });
+
+    const agent = setupAgent({ schemas, actors: { draftText } });
+    const machine = agent.createMachine({
+      context: ({ input }) => ({ prompt: input.prompt, draft: null }),
+      initial: "drafting",
+      states: {
+        drafting: {
+          invoke: {
+            id: "draft",
+            src: "draftText",
+            input: ({ context }) => ({ prompt: context.prompt }),
+            onDone: ({ output }) => ({
+              target: "awaitingApproval",
+              context: { draft: output.result },
+            }),
+          },
+        },
+        awaitingApproval: {
+          on: { APPROVE: { target: "done" } },
+        },
+        done: {
+          type: "final",
+          output: ({ context }) => ({ draft: context.draft ?? "" }),
+        },
+      },
+    });
+
+    const generateText = async (request: AgentTextRequest & { tools: AgentTools }) => ({
+      result: `Draft: ${request.prompt}`,
+    });
+
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText,
+        },
+      }),
+      {
+        input: { prompt: "release notes" },
+      },
+    );
+
+    expect(first.status).toBe("idle");
+    if (first.status !== "idle") {
+      throw new Error("expected idle");
+    }
+    expect(first.snapshot.value).toBe("awaitingApproval");
+
+    const second = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText,
+        },
+      }),
+      {
+        snapshot: first.persist(),
+        event: { type: "APPROVE" },
+      },
+    );
+
+    expect(second.status).toBe("done");
+    expect(second.status === "done" ? second.output : undefined).toEqual({
+      draft: "Draft: release notes",
+    });
+  });
+
+  test("onTransition observes raised events and timer deliveries", async () => {
+    const raisedMachine = setup({}).createMachine({
+      id: "raised-events",
+      initial: "starting",
+      states: {
+        starting: {
+          entry: (_args, enqueue) => enqueue.raise({ type: "CONTINUE" }),
+          on: { CONTINUE: { target: "done" } },
+        },
+        done: { type: "final" },
+      },
+    });
+
+    const raisedEvents: string[] = [];
+    const raised = await runToQuiescence(
+      createAgentRuntime(raisedMachine, {
+        executors: {},
+        onTransition: (_snapshot, event) => raisedEvents.push(event.type),
+      }),
+      {
+        input: undefined,
+      },
+    );
+    expect(raised.status).toBe("done");
+    expect(raisedEvents).toEqual(["@xstate.init"]);
+
+    const timerMachine = setup({}).createMachine({
+      id: "timer-events",
+      initial: "waiting",
+      states: {
+        waiting: { after: { 5: { target: "done" } } },
+        done: { type: "final" },
+      },
+    });
+
+    const timerEvents: string[] = [];
+    const timed = await runToQuiescence(
+      createAgentRuntime(timerMachine, {
+        executors: {},
+        onTransition: (_snapshot, event) => timerEvents.push(event.type),
+      }),
+      {
+        input: undefined,
+      },
+    );
+    expect(timed.status).toBe("done");
+    expect(timerEvents).toContain("xstate.timer");
+  });
+
+  test("idle + resume: pre-idle side effects and model calls run exactly once, never re-executed on resume", async () => {
+    // LangGraph's documented HITL gotcha: code before an inline interrupt()
+    // re-executes when the node resumes, so side effects must be manually
+    // isolated. Idle-first HITL cannot have this failure mode: the resumed
+    // snapshot starts AT the idle state, so states before it never re-enter.
+    // This test pins that guarantee.
+    let sideEffectRuns = 0;
+    let modelCalls = 0;
+
+    const schemas = createAgentSchemas({
+      context: z.object({ topic: z.string(), draft: z.string().nullable() }),
+      input: z.object({ topic: z.string() }),
+      output: z.object({ draft: z.string() }),
+      events: { APPROVE: z.object({}), REJECT: z.object({}) },
+    });
+
+    const draftText = createTextLogic({
+      schemas: {
+        input: z.object({ topic: z.string() }),
+        output: z.string(),
+      },
+      model: "test-model",
+      prompt: ({ input }) => input.topic,
+    });
+
+    const agent = setupAgent({
+      schemas,
+      actors: {
+        draftText,
+        recordAudit: createAsyncLogic<{ recorded: boolean }, unknown>({
+          run: async () => {
+            sideEffectRuns += 1;
+            return { recorded: true };
+          },
+        }),
+      },
+    });
+
+    const machine = agent.createMachine({
+      context: ({ input }) => ({ topic: input.topic, draft: null }),
+      initial: "auditing",
+      states: {
+        auditing: {
+          invoke: {
+            id: "audit",
+            src: "recordAudit",
+            onDone: { target: "drafting" },
+          },
+        },
+        drafting: {
+          invoke: {
+            id: "draft",
+            src: "draftText",
+            input: ({ context }) => ({ topic: context.topic }),
+            onDone: ({ output }) => ({
+              target: "awaitingApproval",
+              context: { draft: output.result },
+            }),
+          },
+        },
+        awaitingApproval: {
+          on: {
+            APPROVE: { target: "done" },
+            REJECT: { target: "drafting" },
+          },
+        },
+        done: {
+          type: "final",
+          output: ({ context }) => ({ draft: context.draft ?? "" }),
+        },
+      },
+    });
+
+    const generateText = async (request: AgentTextRequest & { tools: AgentTools }) => {
+      modelCalls += 1;
+      return { result: `Draft about ${request.prompt}` };
+    };
+
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText,
+        },
+      }),
+      {
+        input: { topic: "incident recap" },
+      },
+    );
+    expect(first.status).toBe("idle");
+    if (first.status !== "idle") throw new Error("expected idle");
+    expect(sideEffectRuns).toBe(1);
+    expect(modelCalls).toBe(1);
+
+    // Full JSON round-trip: the resume must not depend on live actor state.
+    const persisted = JSON.parse(JSON.stringify(first.snapshot));
+
+    const second = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText,
+        },
+      }),
+      {
+        snapshot: persisted,
+        event: { type: "APPROVE" },
+      },
+    );
+
+    expect(second.status).toBe("done");
+    expect(sideEffectRuns).toBe(1); // audit never re-ran
+    expect(modelCalls).toBe(1); // draft never re-billed
+    expect(second.status === "done" ? second.output : undefined).toEqual({
+      draft: "Draft about incident recap",
+    });
+
+    // The loop is still real: an explicit REJECT deliberately re-enters
+    // drafting, so the model runs again by AUTHORED choice, not by accident.
+    const third = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText,
+        },
+      }),
+      {
+        snapshot: persisted,
+        event: { type: "REJECT" },
+      },
+    );
+    expect(third.status).toBe("idle");
+    expect(sideEffectRuns).toBe(1); // audit STILL exactly once
+    expect(modelCalls).toBe(2); // redraft was an explicit transition
+  });
+
+  test("decision path: guard-rejected event retried, then completes; canTake wired through the live actor", async () => {
+    const attackSchema = z.object({ target: z.string() });
+    const healSchema = z.object({});
+
+    const schemas = createAgentSchemas({
+      context: z.object({ hp: z.number() }),
+      input: z.object({}),
+      events: { ATTACK: attackSchema, HEAL: healSchema },
+    });
+
+    const chooseMove = createDecisionLogic({
+      model: "test-model",
+      prompt: "Choose a move.",
+      allowedEvents: ["ATTACK", "HEAL"] as const,
+    });
+
+    const agent = setupAgent({ schemas, actors: { chooseMove } });
+    const machine = agent.createMachine({
+      context: { hp: 10 },
+      initial: "choosingMove",
+      states: {
+        choosingMove: {
+          invoke: {
+            id: "choosingMove",
+            src: "chooseMove",
+            input: {},
+            onError: { target: "fumbled" },
+          },
+          on: {
+            // HEAL only legal when hp < 5 — guard rejects it at hp = 10.
+            HEAL: ({ context }) => (context.hp < 5 ? { target: "healed" } : undefined),
+            ATTACK: { target: "attacked" },
+          },
+        },
+        attacked: { type: "final" },
+        healed: {},
+        fumbled: {},
+      },
+    });
+
+    let callCount = 0;
+    const requestsSeen: AgentDecisionRequest[] = [];
+    const decide = async (request: AgentDecisionRequest): Promise<{ event: ChosenEvent }> => {
+      requestsSeen.push(request);
+      callCount += 1;
+      if (callCount === 1) {
+        // Type + payload legal, but guard-rejected (hp is not < 5).
+        return { event: { type: "HEAL" } };
+      }
+      return { event: { type: "ATTACK", target: "goblin" } };
+    };
+
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText: async () => ({ result: {} }),
+          decide,
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("done");
+    expect(callCount).toBe(2);
+    expect(requestsSeen[1]!.attempts[0]!.failure).toBe("rejected-by-guard");
+  });
+
+  test("maxModelCalls: exceeding the budget settles a max-model-calls error", async () => {
+    const schemas = createAgentSchemas({
+      context: z.object({ count: z.number() }),
+      input: z.object({}),
+      output: z.object({ count: z.number() }),
+    });
+
+    const step = createTextLogic({
+      schemas: {
+        input: z.object({}),
+        output: z.number(),
+      },
+      model: "test-model",
+      prompt: "step",
+    });
+
+    const agent = setupAgent({ schemas, actors: { step } });
+    const machine = agent.createMachine({
+      context: { count: 0 },
+      initial: "looping",
+      states: {
+        looping: {
+          invoke: {
+            id: "step",
+            src: "step",
+            input: {},
+            onDone: ({ output }) => ({
+              target: "looping",
+              reenter: true,
+              context: { count: output.result },
+            }),
+          },
+        },
+      },
+    });
+
+    let calls = 0;
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        maxModelCalls: 3,
+        executors: {
+          generateText: async () => {
+            calls += 1;
+            return { result: calls };
+          },
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.status === "error" ? result.cause : undefined).toBe("max-model-calls");
+  });
+
+  test("maxModelCalls: the overrun is a typed AgentError an invoke's onError can branch on", async () => {
+    const schemas = createAgentSchemas({
+      context: z.object({ calls: z.number(), budgetSpent: z.boolean() }),
+      input: z.object({}),
+      output: z.object({ calls: z.number(), budgetSpent: z.boolean() }),
+    });
+
+    const step = createTextLogic({
+      schemas: { input: z.object({}), output: z.number() },
+      model: "test-model",
+      prompt: "step",
+    });
+
+    const agent = setupAgent({ schemas, actors: { step } });
+    const machine = agent.createMachine({
+      context: { calls: 0, budgetSpent: false },
+      initial: "looping",
+      states: {
+        looping: {
+          invoke: {
+            id: "step",
+            src: "step",
+            input: {},
+            onDone: ({ context }) => ({
+              target: "looping",
+              reenter: true,
+              context: { calls: context.calls + 1 },
+            }),
+            // The budget breach is branchable: a typed AgentError whose `code`
+            // is the same string the settled result's `cause` uses.
+            onError: ({ event }) =>
+              (event.error as { code?: string })?.code === "max-model-calls"
+                ? { target: "budgetSpent", context: { budgetSpent: true } }
+                : { target: "failed" },
+          },
+        },
+        budgetSpent: {
+          type: "final",
+          output: ({ context }) => context,
+        },
+        failed: { type: "final", output: ({ context }) => context },
+      },
+    });
+
+    let calls = 0;
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        maxModelCalls: 2,
+        executors: {
+          generateText: async () => {
+            calls += 1;
+            return { result: calls };
+          },
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    // Handled: the run completes normally instead of settling an error.
+    expect(result.status).toBe("done");
+    expect(result.status === "done" && result.output).toEqual({ calls: 2, budgetSpent: true });
+    expect(calls).toBe(2);
+  });
+
+  test("abort: a pre-aborted signal settles an aborted error", async () => {
+    const schemas = createAgentSchemas({
+      context: z.object({}),
+      input: z.object({}),
+      output: z.object({}),
+    });
+    const step = createTextLogic({
+      schemas: { input: z.object({}), output: z.object({}) },
+      model: "test-model",
+      prompt: "work",
+    });
+    const agent = setupAgent({ schemas, actors: { step } });
+    const machine = agent.createMachine({
+      context: {},
+      initial: "working",
+      states: {
+        working: {
+          invoke: { id: "step", src: "step", input: {}, onDone: { target: "done" } },
+        },
+        done: { type: "final" },
+      },
+    });
+
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        signal: controller.signal,
+        executors: {
+          generateText: async () => ({ result: {} }),
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.status === "error" ? result.cause : undefined).toBe("aborted");
+  });
+
+  test("abort: aborting mid-run settles an aborted error", async () => {
+    const schemas = createAgentSchemas({
+      context: z.object({}),
+      input: z.object({}),
+      output: z.object({}),
+    });
+    const step = createTextLogic({
+      schemas: { input: z.object({}), output: z.object({}) },
+      model: "test-model",
+      prompt: "work",
+    });
+    const agent = setupAgent({ schemas, actors: { step } });
+    const machine = agent.createMachine({
+      context: {},
+      initial: "working",
+      states: {
+        working: {
+          invoke: { id: "step", src: "step", input: {}, onDone: { target: "done" } },
+        },
+        done: { type: "final" },
+      },
+    });
+
+    const controller = new AbortController();
+    const resultPromise = runToQuiescence(
+      createAgentRuntime(machine, {
+        signal: controller.signal,
+        executors: {
+          generateText: () =>
+            new Promise((resolveExec) => {
+              setTimeout(() => resolveExec({ result: {} }), 50);
+            }),
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+    setTimeout(() => controller.abort(), 5);
+
+    const result = await resultPromise;
+    expect(result.status).toBe("error");
+    expect(result.status === "error" ? result.cause : undefined).toBe("aborted");
+  });
+
+  test("machine error: an executor throw with no onError settles a machine error", async () => {
+    const schemas = createAgentSchemas({
+      context: z.object({}),
+      input: z.object({}),
+      output: z.object({}),
+    });
+    const step = createTextLogic({
+      schemas: { input: z.object({}), output: z.object({}) },
+      model: "test-model",
+      prompt: "work",
+    });
+    const agent = setupAgent({ schemas, actors: { step } });
+    const machine = agent.createMachine({
+      context: {},
+      initial: "working",
+      states: {
+        working: {
+          invoke: { id: "step", src: "step", input: {}, onDone: { target: "done" } },
+        },
+        done: { type: "final" },
+      },
+    });
+
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText: async () => {
+            throw new Error("boom");
+          },
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.status === "error" ? result.cause : undefined).toBe("machine");
+    expect(
+      result.status === "error" && result.error instanceof Error ? result.error.message : undefined,
+    ).toBe("boom");
+  });
+
+  describe("bind-time throws", () => {
+    test("a direct-object src with its own executor binds fine (no throw)", async () => {
+      const summarize = createTextLogic(
+        {
+          schemas: {
+            input: z.object({ topic: z.string() }),
+            output: z.string(),
+          },
+          model: "test-model",
+          prompt: ({ input }) => input.topic,
+        },
+        async () => ({ result: "a summary" }),
+      );
+
+      const machine = setup({}).createMachine({
+        id: "direct-object",
+        initial: "working",
+        states: {
+          working: {
+            invoke: {
+              id: "summarize",
+              src: summarize,
+              input: { topic: "state machines" },
+              onDone: { target: "done" },
+            },
+          },
+          done: { type: "final" },
+        },
+      });
+
+      const result = await runToQuiescence(
+        createAgentRuntime(machine, {
+          executors: {
+            generateText: async () => ({ result: {} }),
+          },
+        }),
+      );
+      expect(result.status).toBe("done");
+    });
+
+    test("a machine invoking a decision with no decide option throws naming the source", async () => {
+      const schemas = createAgentSchemas({
+        context: z.object({}),
+        input: z.object({}),
+        events: { ATTACK: z.object({}) },
+      });
+      const chooseMove = createDecisionLogic({ model: "test-model" });
+      const agent = setupAgent({ schemas, actors: { chooseMove } });
+      const machine = agent.createMachine({
+        context: {},
+        initial: "choosingMove",
+        states: {
+          choosingMove: {
+            invoke: { id: "choosingMove", src: "chooseMove", input: {} },
+            on: { ATTACK: { target: "done" } },
+          },
+          done: { type: "final" },
+        },
+      });
+
+      expect(() =>
+        createAgentRuntime(machine, {
+          executors: { generateText: async () => ({ result: {} }) },
+        }),
+      ).toThrow(/chooseMove/);
+    });
+
+    test("a machine invoking an unregistered string src throws naming the source", async () => {
+      const machine = setup({}).createMachine({
+        id: "unregistered",
+        initial: "working",
+        states: {
+          working: {
+            invoke: {
+              id: "x",
+              src: "notRegistered",
+              onDone: { target: "done" },
+            } as never,
+          },
+          done: { type: "final" },
+        },
+      });
+
+      expect(() =>
+        createAgentRuntime(machine, {
+          executors: { generateText: async () => ({ result: {} }) },
+        }),
+      ).toThrow(/notRegistered/);
+    });
+
+    test("a STREAM-mode TextLogic invoke with no streamText option throws naming the source", async () => {
+      const streamSummary = createTextLogic({
+        mode: "stream",
+        schemas: { input: z.object({}), output: z.string() },
+        model: "test-model",
+        prompt: "summarize",
+      });
+      const agent = setupAgent({
+        schemas: createAgentSchemas({ context: z.object({}), input: z.object({}) }),
+        actors: { streamSummary },
+      });
+      const machine = agent.createMachine({
+        context: {},
+        initial: "streaming",
+        states: {
+          streaming: {
+            invoke: {
+              id: "streamSummary",
+              src: "streamSummary",
+              input: {},
+              onDone: { target: "done" },
+            },
+          },
+          done: { type: "final" },
+        },
+      });
+
+      expect(() =>
+        createAgentRuntime(machine, {
+          executors: { generateText: async () => ({ result: {} }) },
+        }),
+      ).toThrow(/streamSummary/);
+    });
+
+    test("a direct-object invoke src that is an agent logic WITHOUT its own executor throws", async () => {
+      const summarize = createTextLogic({
+        schemas: { input: z.object({ topic: z.string() }), output: z.string() },
+        model: "test-model",
+        prompt: ({ input }) => input.topic,
+      });
+
+      const machine = setup({}).createMachine({
+        id: "direct-object-no-executor",
+        initial: "working",
+        states: {
+          working: {
+            invoke: {
+              id: "summarize",
+              src: summarize,
+              input: { topic: "state machines" },
+              onDone: { target: "done" },
+            },
+          },
+          done: { type: "final" },
+        },
+      });
+
+      expect(() =>
+        createAgentRuntime(machine, {
+          executors: { generateText: async () => ({ result: {} }) },
+        }),
+      ).toThrow(/direct-object/);
+    });
+
+    // A child machine whose states invoke agent requests is opaque to the
+    // parent-level source walk. Child requests do NOT inherit the parent
+    // runAgent's executors at runtime (verified by probe: an unbound child
+    // request settles the run 'error'/parks it), so the bind walk must
+    // descend into invoked child machines and fail fast when a child request
+    // has no host execution of its own.
+    describe("child-machine recursion", () => {
+      // Builds a child machine that invokes `researchTopic` by name. When
+      // `bindChildRequest` is true, the request carries its own executor
+      // (via nested `.provide` + `.withExecutor`) so it runs itself.
+      const makeChildMachine = (bindChildRequest: boolean, depth = 1) => {
+        const researchTopic = createTextLogic({
+          schemas: { input: z.object({ topic: z.string() }), output: z.string() },
+          model: "test-model",
+          prompt: ({ input }) => input.topic,
+        });
+        const childAgent = setupAgent({
+          context: z.object({ topic: z.string(), research: z.string().nullable() }),
+          input: z.object({ topic: z.string() }),
+          output: z.object({ research: z.string() }),
+          actors: { researchTopic },
+        });
+        let childMachine = childAgent.createMachine({
+          id: `child-${depth}`,
+          context: ({ input }) => ({ topic: input.topic, research: null }),
+          initial: "researching",
+          states: {
+            researching: {
+              invoke: {
+                src: "researchTopic",
+                input: ({ context }) => ({ topic: context.topic }),
+                onDone: ({ output }) => ({
+                  target: "done",
+                  context: { research: output.result },
+                }),
+              },
+            },
+            done: {
+              type: "final",
+              output: ({ context }) => ({ research: context.research ?? "" }),
+            },
+          },
+        });
+        if (bindChildRequest) {
+          childMachine = childMachine.provide({
+            actors: {
+              researchTopic: researchTopic.withExecutor(async ({ input }) => ({
+                result: `Research: ${input.topic}`,
+              })),
+            },
+          });
+        }
+        return childMachine;
+      };
+
+      const makeParentMachine = (childMachine: ReturnType<typeof makeChildMachine>) => {
+        const parentAgent = setupAgent({
+          context: z.object({ topic: z.string(), research: z.string().nullable() }),
+          input: z.object({ topic: z.string() }),
+          output: z.object({ research: z.string() }),
+          actors: { child: childMachine },
+        });
+        return parentAgent.createMachine({
+          id: "parent",
+          context: ({ input }) => ({ topic: input.topic, research: null }),
+          initial: "delegating",
+          states: {
+            delegating: {
+              invoke: {
+                src: "child",
+                input: ({ context }: { context: { topic: string } }) => ({
+                  topic: context.topic,
+                }),
+                onDone: ({ output }) => ({
+                  target: "done",
+                  context: { research: (output as { research: string }).research },
+                }),
+              },
+            },
+            done: {
+              type: "final",
+              output: ({ context }) => ({ research: context.research ?? "" }),
+            },
+          },
+        });
+      };
+
+      test("(1) an UNBOUND child request inherits the parent generateText and runs to done", async () => {
+        const parentMachine = makeParentMachine(makeChildMachine(false));
+
+        const result = await runToQuiescence(
+          createAgentRuntime(parentMachine, {
+            executors: {
+              generateText: async ({ prompt }) => ({ result: `parent-ran: ${prompt}` }),
+            },
+          }),
+          {
+            input: { topic: "agents" },
+          },
+        );
+
+        expect(result.status).toBe("done");
+        expect(result.status === "done" ? result.output : undefined).toEqual({
+          research: "parent-ran: agents",
+        });
+      });
+
+      test("(2) a child with its own .withExecutor keeps it (parent generateText NOT called for it)", async () => {
+        const parentMachine = makeParentMachine(makeChildMachine(true));
+
+        let parentCalls = 0;
+        const result = await runToQuiescence(
+          createAgentRuntime(parentMachine, {
+            executors: {
+              generateText: async () => {
+                parentCalls += 1;
+                return { result: "unused" };
+              },
+            },
+          }),
+          {
+            input: { topic: "agents" },
+          },
+        );
+
+        expect(result.status).toBe("done");
+        expect(result.status === "done" ? result.output : undefined).toEqual({
+          research: "Research: agents",
+        });
+        expect(parentCalls).toBe(0);
+      });
+
+      test("(3) grandchild depth: an unbound request in a child-of-child inherits and runs to done", async () => {
+        // Grandchild (depth 2) has an unbound request; child (depth 1)
+        // invokes the grandchild; parent invokes the child.
+        const grandchild = makeChildMachine(false, 2);
+
+        const midAgent = setupAgent({
+          context: z.object({ topic: z.string(), research: z.string().nullable() }),
+          input: z.object({ topic: z.string() }),
+          output: z.object({ research: z.string() }),
+          actors: { grandchild },
+        });
+        const midMachine = midAgent.createMachine({
+          id: "mid",
+          context: ({ input }) => ({ topic: input.topic, research: null }),
+          initial: "delegating",
+          states: {
+            delegating: {
+              invoke: {
+                src: "grandchild",
+                input: ({ context }: { context: { topic: string } }) => ({
+                  topic: context.topic,
+                }),
+                onDone: ({ output }) => ({
+                  target: "done",
+                  context: { research: (output as { research: string }).research },
+                }),
+              },
+            },
+            done: {
+              type: "final",
+              output: ({ context }) => ({ research: context.research ?? "" }),
+            },
+          },
+        });
+
+        const parentMachine = makeParentMachine(
+          midMachine as unknown as ReturnType<typeof makeChildMachine>,
+        );
+
+        // The grandchild's unbound `researchTopic` inherits the top-level
+        // generateText through parent > mid > grandchild (all string-keyed).
+        const result = await runToQuiescence(
+          createAgentRuntime(parentMachine, {
+            executors: {
+              generateText: async ({ prompt }) => ({ result: `depth: ${prompt}` }),
+            },
+          }),
+          {
+            input: { topic: "agents" },
+          },
+        );
+
+        expect(result.status).toBe("done");
+        expect(result.status === "done" ? result.output : undefined).toEqual({
+          research: "depth: agents",
+        });
+      });
+
+      test("(4) a recursively self-invoking machine does not infinite-loop the bind walk", async () => {
+        // A machine that invokes itself by name (cycle). The bind walk must
+        // terminate via the visited-set guard rather than recurse forever.
+        const selfAgent = setupAgent({
+          context: z.object({ n: z.number() }),
+          input: z.object({ n: z.number() }),
+          output: z.object({}),
+        });
+        const selfMachine = selfAgent.createMachine({
+          id: "self",
+          context: ({ input }) => ({ n: input.n }),
+          initial: "looping",
+          states: {
+            looping: {
+              invoke: {
+                src: "self",
+                input: ({ context }: { context: { n: number } }) => ({ n: context.n - 1 }),
+                onDone: { target: "done" },
+              } as never,
+            },
+            done: { type: "final", output: {} },
+          },
+        });
+        // Make the 'self' source resolve to the machine itself, creating a
+        // genuine identity cycle for the bind walk to guard against. Mutating
+        // sources in place (rather than .provide, which returns a new
+        // object) keeps the invoked source === the machine being walked.
+        (selfMachine.sources.actors as Record<string, unknown>).self = selfMachine;
+
+        // The point under test is the BIND walk (the visited-set guard): it
+        // must return rather than recurse forever on the identity cycle. A
+        // pre-aborted signal settles the run right after binding, so reaching
+        // any settled result at all proves the bind walk terminated (an
+        // infinite bind loop would throw a RangeError / hang before this).
+        const result = await runToQuiescence(
+          createAgentRuntime(selfMachine, {
+            signal: AbortSignal.abort(),
+            executors: {
+              generateText: async () => ({ result: "x" }),
+            },
+          }),
+          {
+            input: { n: 0 },
+          },
+        );
+        expect(["done", "idle", "error"]).toContain(result.status);
+      });
+
+      test("(5) child requests count toward maxModelCalls and appear in onTrace", async () => {
+        const parentMachine = makeParentMachine(makeChildMachine(false));
+
+        // The child's single inherited model call shows up in onTrace with the
+        // child request's own src.
+        const trace: AgentTraceEvent<typeof parentMachine>[] = [];
+        const ok = await runToQuiescence(
+          createAgentRuntime(parentMachine, {
+            onTrace: (event) => trace.push(event),
+            executors: {
+              generateText: async () => ({ result: "y" }),
+            },
+          }),
+          {
+            input: { topic: "agents" },
+          },
+        );
+        expect(ok.status).toBe("done");
+        expect(
+          trace
+            .filter((event) => event.type === "request.start")
+            .map((event) => (event.request as { src?: string }).src),
+        ).toContain("researchTopic");
+
+        // ...and it draws from the SAME shared budget: capping at 0 makes the
+        // child's model call exceed it, settling a max-model-calls error.
+        const capped = await runToQuiescence(
+          createAgentRuntime(parentMachine, {
+            maxModelCalls: 0,
+            executors: {
+              generateText: async () => ({ result: "y" }),
+            },
+          }),
+          {
+            input: { topic: "agents" },
+          },
+        );
+        expect(capped.status).toBe("error");
+        expect(capped.status === "error" ? capped.cause : undefined).toBe("max-model-calls");
+      });
+
+      test("(6) a missing streamText for a child STREAM request throws at bind naming the chain", async () => {
+        const streamResearch = createTextLogic({
+          mode: "stream",
+          schemas: { input: z.object({ topic: z.string() }), output: z.string() },
+          model: "test-model",
+          prompt: ({ input }) => input.topic,
+        });
+        const childAgent = setupAgent({
+          context: z.object({ topic: z.string(), research: z.string().nullable() }),
+          input: z.object({ topic: z.string() }),
+          output: z.object({ research: z.string() }),
+          actors: { streamResearch },
+        });
+        const streamChild = childAgent.createMachine({
+          id: "stream-child",
+          context: ({ input }) => ({ topic: input.topic, research: null }),
+          initial: "researching",
+          states: {
+            researching: {
+              invoke: {
+                src: "streamResearch",
+                input: ({ context }) => ({ topic: context.topic }),
+                onDone: ({ output }) => ({ target: "done", context: { research: output.result } }),
+              },
+            },
+            done: {
+              type: "final",
+              output: ({ context }) => ({ research: context.research ?? "" }),
+            },
+          },
+        });
+        const parentMachine = makeParentMachine(
+          streamChild as unknown as ReturnType<typeof makeChildMachine>,
+        );
+
+        // generateText is present but streamText is not — the child's stream
+        // request has no executor to inherit, so bind fails naming the chain.
+        expect(() =>
+          createAgentRuntime(parentMachine, {
+            executors: {
+              generateText: async () => ({ result: "x" }),
+            },
+          }),
+        ).toThrow(/child machine.*streamText/s);
+      });
+    });
+  });
+
+  test("after-timer: a pending after transition is not idle; runAgent resolves done", async () => {
+    const machine = setup({}).createMachine({
+      id: "after-timer",
+      initial: "waiting",
+      states: {
+        waiting: {
+          after: { 20: { target: "done-state" } },
+        },
+        "done-state": { type: "final" },
+      },
+    });
+
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText: async () => ({ result: {} }),
+        },
+      }),
+      {
+        input: undefined,
+      },
+    );
+
+    expect(result.status).toBe("done");
+  });
+
+  test("onTransition: fires with the causing event type at least once", async () => {
+    const machine = setup({}).createMachine({
+      id: "transition-observed",
+      initial: "a",
+      states: {
+        a: { on: { GO: { target: "b" } } },
+        b: { type: "final" },
+      },
+    });
+
+    const seenEventTypes: string[] = [];
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        onTransition: (_snapshot, event) => {
+          seenEventTypes.push(event.type);
+        },
+        executors: {
+          generateText: async () => ({ result: {} }),
+        },
+      }),
+      {
+        input: undefined,
+        event: { type: "GO" },
+      },
+    );
+
+    // A machine with no invokes and only an `on: { GO }` handler settles
+    // idle before the event is sent unless sent as part of this same run;
+    // runAgent sends options.event right after start(), so GO is applied.
+    expect(result.status === "done" || result.status === "idle").toBe(true);
+    expect(seenEventTypes).toContain("GO");
+  });
+
+  describe('omitted allowedEvents: "all currently-legal events"', () => {
+    const attackSchema = z.object({ target: z.string() });
+    const healSchema = z.object({});
+
+    const schemas = createAgentSchemas({
+      context: z.object({ hp: z.number(), messages: z.array(z.unknown()) }),
+      input: z.object({}),
+      events: { ATTACK: attackSchema, HEAL: healSchema },
+    });
+
+    test("runAgent + inline agent.decide with allowedEvents omitted: candidates are exactly the legal events, with inputSchema attached", async () => {
+      const agent = setupAgent({ schemas });
+      const machine = agent.createMachine({
+        context: { hp: 10, messages: [] },
+        initial: "choosingMove",
+        states: {
+          choosingMove: {
+            invoke: {
+              id: "choosingMove",
+              // No allowedEvents — omitted means "all currently-legal events."
+              src: "agent.decide",
+              input: { model: "test-model", prompt: "Choose a move." },
+              onError: { target: "fumbled" },
+            },
+            on: {
+              // HEAL only legal when hp < 5 — type-legal but guard-narrowed here.
+              HEAL: ({ context }) => (context.hp < 5 ? { target: "healed" } : undefined),
+              ATTACK: { target: "attacked" },
+            },
+          },
+          attacked: { type: "final" },
+          healed: {},
+          fumbled: {},
+        },
+      });
+
+      let seenEvents: readonly { type: string; inputSchema?: unknown }[] = [];
+      const decide = async (request: AgentDecisionRequest): Promise<{ event: ChosenEvent }> => {
+        seenEvents = request.events;
+        return { event: { type: "ATTACK", target: "goblin" } };
+      };
+
+      const result = await runToQuiescence(
+        createAgentRuntime(machine, {
+          executors: {
+            generateText: async () => ({ result: {} }),
+            decide,
+          },
+        }),
+        {
+          input: {},
+        },
+      );
+
+      expect(result.status).toBe("done");
+      expect(seenEvents.map((event) => event.type).sort()).toEqual(["ATTACK", "HEAL"]);
+      expect(seenEvents.find((event) => event.type === "ATTACK")?.inputSchema).toBe(attackSchema);
+      expect(seenEvents.find((event) => event.type === "HEAL")?.inputSchema).toBe(healSchema);
+    });
+
+    test("runAgent + createDecisionLogic actor with allowedEvents omitted: candidates are exactly the legal events", async () => {
+      const chooseMove = createDecisionLogic({
+        model: "test-model",
+        prompt: "Choose a move.",
+        // allowedEvents omitted.
+      });
+
+      const agent = setupAgent({ schemas, actors: { chooseMove } });
+      const machine = agent.createMachine({
+        context: { hp: 10, messages: [] },
+        initial: "choosingMove",
+        states: {
+          choosingMove: {
+            invoke: {
+              id: "choosingMove",
+              src: "chooseMove",
+              input: {},
+              onError: { target: "fumbled" },
+            },
+            on: {
+              HEAL: ({ context }) => (context.hp < 5 ? { target: "healed" } : undefined),
+              ATTACK: { target: "attacked" },
+            },
+          },
+          attacked: { type: "final" },
+          healed: {},
+          fumbled: {},
+        },
+      });
+
+      let seenEvents: readonly { type: string }[] = [];
+      const decide = async (request: AgentDecisionRequest): Promise<{ event: ChosenEvent }> => {
+        seenEvents = request.events;
+        return { event: { type: "ATTACK", target: "goblin" } };
+      };
+
+      const result = await runToQuiescence(
+        createAgentRuntime(machine, {
+          executors: {
+            generateText: async () => ({ result: {} }),
+            decide,
+          },
+        }),
+        {
+          input: {},
+        },
+      );
+
+      expect(result.status).toBe("done");
+      expect(seenEvents.map((event) => event.type).sort()).toEqual(["ATTACK", "HEAL"]);
+    });
+
+    test("guard-narrowing still intact: a type-legal event offered as a candidate can still be canTake-rejected", async () => {
+      const agent = setupAgent({ schemas });
+      const machine = agent.createMachine({
+        context: { hp: 10, messages: [] },
+        initial: "choosingMove",
+        states: {
+          choosingMove: {
+            invoke: {
+              id: "choosingMove",
+              src: "agent.decide",
+              input: { model: "test-model", prompt: "Choose a move." },
+              onError: { target: "fumbled" },
+            },
+            on: {
+              // HEAL is type-legal (a declared event) but guard-narrowed:
+              // illegal at hp = 10, so the function-transition returns
+              // undefined. It must still appear as a candidate (§2.7
+              // type-only filter) even though canTake later rejects it
+              // (mode-3).
+              HEAL: ({ context }) => (context.hp < 5 ? { target: "healed" } : undefined),
+              ATTACK: { target: "attacked" },
+            },
+          },
+          attacked: { type: "final" },
+          healed: {},
+          fumbled: {},
+        },
+      });
+
+      let callCount = 0;
+      const requestsSeen: AgentDecisionRequest[] = [];
+      const decide = async (request: AgentDecisionRequest): Promise<{ event: ChosenEvent }> => {
+        requestsSeen.push(request);
+        callCount += 1;
+        if (callCount === 1) {
+          return { event: { type: "HEAL" } };
+        }
+        return { event: { type: "ATTACK", target: "goblin" } };
+      };
+
+      const result = await runToQuiescence(
+        createAgentRuntime(machine, {
+          executors: {
+            generateText: async () => ({ result: {} }),
+            decide,
+          },
+        }),
+        {
+          input: {},
+        },
+      );
+
+      expect(result.status).toBe("done");
+      expect(requestsSeen[0]!.events.map((event) => event.type).sort()).toEqual(["ATTACK", "HEAL"]);
+      expect(requestsSeen[1]!.attempts[0]!.failure).toBe("rejected-by-guard");
+    });
+
+    test("bare createActor + .withExecutor + allowedEvents omitted: rejects immediately with guidance, not AgentDecisionExhaustedError", async () => {
+      const chooseMove = createDecisionLogic(
+        {
+          model: "test-model",
+          prompt: "Choose a move.",
+          // allowedEvents omitted — unresolvable without a snapshot-aware host.
+        },
+        async () => ({ event: { type: "ATTACK", target: "goblin" } }),
+      );
+
+      const actor = createActor(chooseMove, { input: {} });
+      actor.subscribe({ error: () => {} });
+      actor.start();
+
+      await expect(toPromise(actor)).rejects.toThrow(
+        /omitted `allowedEvents`.*snapshot-aware host/s,
+      );
+    });
+  });
+
+  test("auto-delivery: the decided event is delivered exactly once despite transition-fn re-evaluation", async () => {
+    const schemas = createAgentSchemas({
+      context: z.object({ attackCount: z.number() }),
+      input: z.object({}),
+      events: { ATTACK: z.object({}) },
+    });
+
+    const chooseMove = createDecisionLogic({
+      model: "test-model",
+      prompt: "Choose a move.",
+      allowedEvents: ["ATTACK"] as const,
+    });
+
+    const agent = setupAgent({ schemas, actors: { chooseMove } });
+    const machine = agent.createMachine({
+      context: { attackCount: 0 },
+      initial: "choosingMove",
+      states: {
+        choosingMove: {
+          invoke: {
+            id: "choosingMove",
+            src: "chooseMove",
+            input: {},
+          },
+          on: {
+            // Counts how many times ATTACK is actually processed as an
+            // event by the machine — the auto-delivery send happens once
+            // inside the decision actor's own async run, so transition-fn
+            // re-evaluation (spike S3: 8x) cannot multiply delivery.
+            ATTACK: ({ context }) => ({
+              target: "attacked",
+              context: { attackCount: context.attackCount + 1 },
+            }),
+          },
+        },
+        attacked: { type: "final" },
+      },
+    });
+
+    let attackEventsObserved = 0;
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        onTransition: (_snapshot, event) => {
+          if (event.type === "ATTACK") {
+            attackEventsObserved += 1;
+          }
+        },
+        executors: {
+          generateText: async () => ({ result: {} }),
+          decide: async () => ({ event: { type: "ATTACK" } }),
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("done");
+    expect(result.status === "done" ? result.snapshot.context.attackCount : undefined).toBe(1);
+    expect(attackEventsObserved).toBe(1);
+  });
+
+  test("chosen event whose transition stays in-state: the invoke completes and onDone observes the chosen event as output", async () => {
+    const schemas = createAgentSchemas({
+      context: z.object({ noted: z.boolean(), notedType: z.string().nullable() }),
+      input: z.object({}),
+      output: z.object({ noted: z.boolean(), notedType: z.string().nullable() }),
+      events: { NOTE: z.object({}) },
+    });
+    const agent = setupAgent({ schemas });
+    const machine = agent.createMachine({
+      context: { noted: false, notedType: null },
+      initial: "deciding",
+      states: {
+        deciding: {
+          invoke: {
+            src: "agent.decide",
+            input: {
+              model: "test-model",
+              prompt: "Note it.",
+              allowedEvents: ["NOTE"] as const,
+            },
+            // NOTE is an INTERNAL transition (no target): it updates context but
+            // stays in `deciding`, so the auto-delivered event does NOT cancel
+            // the invoke. The invoke completes and this onDone fires with the
+            // chosen event as its output.
+            onDone: ({ output }) => ({
+              target: "recorded",
+              context: { notedType: (output as { type: string }).type },
+            }),
+          },
+          on: {
+            NOTE: ({ context: _context }) => ({ context: { noted: true } }),
+          },
+        },
+        recorded: {
+          type: "final",
+          output: ({ context }) => ({ noted: context.noted, notedType: context.notedType }),
+        },
+      },
+    });
+
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText: async () => ({ result: {} }),
+          decide: async (): Promise<{ event: ChosenEvent }> => ({ event: { type: "NOTE" } }),
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("done");
+    if (result.status !== "done") throw new Error("expected done");
+    // Auto-delivery ran the in-state NOTE transition (context.noted set true)…
+    expect(result.output.noted).toBe(true);
+    // …and because NOTE stayed in-state the invoke completed, so onDone saw the
+    // chosen event as its output.
+    expect(result.output.notedType).toBe("NOTE");
+  });
+
+  test("decision inside an invoked child machine delivers to the child (invokingActorOf)", async () => {
+    const childSchemas = createAgentSchemas({
+      context: z.object({ move: z.string().nullable() }),
+      input: z.object({}),
+      output: z.object({ move: z.string() }),
+      events: { ATTACK: z.object({}), FLEE: z.object({}) },
+    });
+    const childAgent = setupAgent({ schemas: childSchemas });
+    const childMachine = childAgent.createMachine({
+      context: { move: null },
+      initial: "choosing",
+      states: {
+        choosing: {
+          invoke: {
+            src: "agent.decide",
+            input: {
+              model: "test-model",
+              prompt: "Choose a move.",
+              allowedEvents: ["ATTACK", "FLEE"] as const,
+            },
+            onError: { target: "stuck" },
+          },
+          on: {
+            // The chosen event must be delivered to THIS child actor (not the
+            // root) to drive it to `done` — that is what invokingActorOf covers.
+            ATTACK: ({ context: _context }) => ({ target: "done", context: { move: "ATTACK" } }),
+            FLEE: ({ context: _context }) => ({ target: "done", context: { move: "FLEE" } }),
+          },
+        },
+        done: { type: "final", output: ({ context }) => ({ move: context.move ?? "?" }) },
+        stuck: {},
+      },
+    });
+
+    const parentSchemas = createAgentSchemas({
+      context: z.object({ childMove: z.string().nullable() }),
+      input: z.object({}),
+      output: z.object({ childMove: z.string().nullable() }),
+    });
+    const parentAgent = setupAgent({
+      schemas: parentSchemas,
+      actors: { child: childMachine },
+    });
+    const parentMachine = parentAgent.createMachine({
+      context: { childMove: null },
+      initial: "delegating",
+      states: {
+        delegating: {
+          invoke: {
+            src: "child",
+            input: {},
+            onDone: ({ output }) => ({
+              target: "done",
+              context: { childMove: (output as { move: string }).move },
+            }),
+          },
+        },
+        done: { type: "final", output: ({ context }) => ({ childMove: context.childMove }) },
+      },
+    });
+
+    const result = await runToQuiescence(
+      createAgentRuntime(parentMachine, {
+        executors: {
+          generateText: async () => ({ result: {} }),
+          decide: async (): Promise<{ event: ChosenEvent }> => ({ event: { type: "ATTACK" } }),
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("done");
+    if (result.status !== "done") throw new Error("expected done");
+    // The child transitioned to its own `done` off the delivered ATTACK and
+    // produced that output — proof the event reached the child, not the root.
+    expect(result.output.childMove).toBe("ATTACK");
+  });
+});
+
+describe("emitted events (runAgent `on`)", () => {
+  const agent = setupAgent({
+    context: z.object({ topic: z.string(), draft: z.string().nullable() }),
+    input: z.object({ topic: z.string() }),
+    output: z.object({ draft: z.string() }),
+    emitted: {
+      DRAFTING_STARTED: z.object({ topic: z.string() }),
+      DRAFTED: z.object({ length: z.number() }),
+    },
+    requests: {
+      draft: {
+        schemas: { input: z.object({ topic: z.string() }), output: z.string() },
+        model: "writer",
+        prompt: ({ input }) => `Draft: ${input.topic}`,
+      },
+    },
+  });
+
+  const machine = agent.createMachine({
+    context: ({ input }) => ({ topic: input.topic, draft: null }),
+    initial: "drafting",
+    states: {
+      drafting: {
+        entry: ({ context }, enq) => {
+          enq.emit({ type: "DRAFTING_STARTED", topic: context.topic });
+        },
+        invoke: {
+          src: "draft",
+          input: ({ context }) => ({ topic: context.topic }),
+          onDone: ({ output }, enq) => {
+            enq.emit({ type: "DRAFTED", length: output.result.length });
+            return { target: "done", context: { draft: output.result } };
+          },
+        },
+      },
+      done: { type: "final", output: ({ context }) => ({ draft: context.draft ?? "" }) },
+    },
+  });
+
+  test("a throwing `on` handler is reported, and the run goes on", async () => {
+    const report = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await runToQuiescence(
+        createAgentRuntime(machine, {
+          on: {
+            DRAFTING_STARTED: () => {
+              throw new Error("sink down");
+            },
+          },
+          executors: { generateText: async () => ({ result: "a draft" }) },
+        }),
+        { input: { topic: "rivers" } },
+      );
+
+      expect(result.status).toBe("done");
+      expect(String(report.mock.calls[0]![0])).toContain("on['DRAFTING_STARTED']");
+    } finally {
+      report.mockRestore();
+    }
+  });
+
+  test("`on` handlers fire per type, including events emitted during the initial transition", async () => {
+    const started: string[] = [];
+    const drafted: number[] = [];
+
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        on: {
+          DRAFTING_STARTED: (emitted) => started.push(emitted.topic),
+          DRAFTED: (emitted) => drafted.push(emitted.length),
+        },
+        executors: {
+          generateText: async () => ({ result: "a draft" }),
+        },
+      }),
+      {
+        input: { topic: "rivers" },
+      },
+    );
+
+    expect(result.status).toBe("done");
+    expect(started).toEqual(["rivers"]);
+    expect(drafted).toEqual(["a draft".length]);
+  });
+
+  test("'*' catches every emitted event", async () => {
+    const seen: string[] = [];
+
+    await runToQuiescence(
+      createAgentRuntime(machine, {
+        on: { "*": (emitted) => seen.push(emitted.type) },
+        executors: {
+          generateText: async () => ({ result: "a draft" }),
+        },
+      }),
+      {
+        input: { topic: "rivers" },
+      },
+    );
+
+    expect(seen).toEqual(["DRAFTING_STARTED", "DRAFTED"]);
+  });
+
+  test("onTrace emits an ordered run/request/transition/emit/end stream", async () => {
+    const trace: AgentTraceEvent<typeof machine>[] = [];
+
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        onTrace: (event) => trace.push(event),
+        executors: {
+          generateText: async () => ({ result: "a draft", usage: { totalTokens: 3 } }),
+        },
+      }),
+      {
+        input: { topic: "rivers" },
+      },
+    );
+
+    expect(result.status).toBe("done");
+    expect(trace.map((event) => event.seq)).toEqual(trace.map((_, index) => index + 1));
+    expect(trace[0]).toEqual(expect.objectContaining({ type: "run.start", seq: 1 }));
+    expect(trace.at(-1)).toEqual(expect.objectContaining({ type: "run.end", status: "done" }));
+    expect(trace.at(-1)).not.toHaveProperty("events");
+    expect(trace.map((event) => event.type)).toEqual(
+      expect.arrayContaining([
+        "emit",
+        "machine.transition",
+        "request.start",
+        "request.end",
+        "run.end",
+      ]),
+    );
+    expect(trace.filter((event) => event.type === "emit").map((event) => event.event.type)).toEqual(
+      ["DRAFTING_STARTED", "DRAFTED"],
+    );
+    expect(trace.find((event) => event.type === "request.end")).toEqual(
+      expect.objectContaining({
+        type: "request.end",
+        output: "a draft",
+        raw: { result: "a draft", usage: { totalTokens: 3 } },
+      }),
+    );
+
+    // Every trace event carries the run's identity (version === structural hash)
+    // and the versioned schema stamp.
+    const version = getMachineStructuralHash(machine);
+    expect(trace.length).toBeGreaterThan(0);
+    for (const event of trace) {
+      expect(event.schemaVersion).toBe(AGENT_TRACE_SCHEMA_VERSION);
+      expect(event.machineId).toEqual(expect.any(String));
+      expect(event.machineVersion).toBe(version);
+    }
+    // All share the same runId across the stream.
+    expect(new Set(trace.map((event) => event.runId)).size).toBe(1);
+  });
+
+  test("the machine's own version (not the structural hash) fills every trace event", async () => {
+    const trace: AgentTraceEvent[] = [];
+    const versioned = setup({}).createMachine({
+      id: "versionedTrace",
+      version: "v-declared",
+      context: {},
+      initial: "done",
+      states: { done: { type: "final" } },
+    });
+
+    await runToQuiescence(
+      createAgentRuntime(versioned, {
+        onTrace: (event) => trace.push(event),
+        executors: {
+          generateText: async () => ({ result: "a draft" }),
+        },
+      }),
+    );
+
+    expect(trace.length).toBeGreaterThan(0);
+    for (const event of trace) {
+      expect(event.machineVersion).toBe("v-declared");
+    }
+  });
+});
+
+describe("onTrace stream chunks", () => {
+  test("stream chunks are traced with their request", async () => {
+    const agent = setupAgent({
+      context: z.object({ joke: z.string().nullable() }),
+      output: z.object({ joke: z.string() }),
+      requests: {
+        joke: {
+          schemas: { input: z.object({}), output: z.string() },
+          model: "m",
+          mode: "stream",
+          prompt: () => "joke",
+        },
+      },
+    });
+
+    const machine = agent.createMachine({
+      context: { joke: null },
+      initial: "writing",
+      states: {
+        writing: {
+          invoke: {
+            src: "joke",
+            input: () => ({}),
+            onDone: ({ output }) => ({ target: "done", context: { joke: output.result } }),
+          },
+        },
+        done: { type: "final", output: ({ context }) => ({ joke: context.joke ?? "" }) },
+      },
+    });
+
+    const trace: AgentTraceEvent<typeof machine>[] = [];
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        onTrace: (event) => trace.push(event),
+        executors: {
+          generateText: async () => ({ result: {} }),
+          streamText: async (_request, info) => {
+            info?.onChunk?.("a");
+            info?.onChunk?.("b");
+            return { result: "ab" };
+          },
+        },
+      }),
+    );
+
+    expect(result.status).toBe("done");
+    expect(
+      trace
+        .filter((event) => event.type === "stream.chunk")
+        .map((event) => [event.chunk, event.request.src]),
+    ).toEqual([
+      ["a", "joke"],
+      ["b", "joke"],
+    ]);
+  });
+});
+
+describe("sugar callbacks are projections of onTrace", () => {
+  test("onChunk/onResult/onTransition keep their position around the matching trace event", async () => {
+    const agent = setupAgent({
+      context: z.object({ joke: z.string().nullable() }),
+      output: z.object({ joke: z.string() }),
+      requests: {
+        joke: {
+          schemas: { input: z.object({}), output: z.string() },
+          model: "m",
+          mode: "stream",
+          prompt: () => "joke",
+        },
+      },
+    });
+
+    const machine = agent.createMachine({
+      context: { joke: null },
+      initial: "writing",
+      states: {
+        writing: {
+          invoke: {
+            src: "joke",
+            input: () => ({}),
+            onDone: ({ output }) => ({ target: "done", context: { joke: output.result } }),
+          },
+        },
+        done: { type: "final", output: ({ context }) => ({ joke: context.joke ?? "" }) },
+      },
+    });
+
+    // One interleaved log: every trace event and every sugar callback, in order.
+    const log: string[] = [];
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        onTrace: (event) => log.push(`trace:${event.type}`),
+        onChunk: (chunk, info) => log.push(`chunk:${chunk}:${info.request.src}`),
+        onResult: (_request, { result }) => log.push(`result:${String(result)}`),
+        onTransition: (_snapshot, event) => log.push(`transition:${event.type}`),
+        executors: {
+          streamText: async (_request, info) => {
+            info?.onChunk?.("a");
+            info?.onChunk?.("b");
+            return { result: "ab" };
+          },
+        },
+      }),
+    );
+
+    expect(result.status).toBe("done");
+
+    // onChunk fires immediately AFTER its stream.chunk trace.
+    const chunkTraces = log.flatMap((entry, i) => (entry === "trace:stream.chunk" ? [i] : []));
+    expect(chunkTraces).toHaveLength(2);
+    expect(chunkTraces.map((i) => log[i + 1])).toEqual(["chunk:a:joke", "chunk:b:joke"]);
+
+    // onResult fires immediately BEFORE its request.end trace.
+    const endTraces = log.flatMap((entry, i) => (entry === "trace:request.end" ? [i] : []));
+    expect(endTraces).toHaveLength(1);
+    expect(log[endTraces[0]! - 1]).toBe("result:ab");
+
+    // onTransition fires immediately AFTER its machine.transition trace.
+    const transitionTraces = log.flatMap((entry, i) =>
+      entry === "trace:machine.transition" ? [i] : [],
+    );
+    expect(transitionTraces.length).toBeGreaterThan(0);
+    for (const i of transitionTraces) {
+      expect(log[i + 1]).toMatch(/^transition:/);
+    }
+    // No sugar callback fires without its trace event.
+    expect(log.filter((entry) => entry.startsWith("transition:"))).toHaveLength(
+      transitionTraces.length,
+    );
+  });
+});
+
+describe("onResult raw pass-through", () => {
+  test("extra executor-envelope keys (usage, ...) reach onResult.raw verbatim", async () => {
+    const agent = setupAgent({
+      context: z.object({ answer: z.string().nullable() }),
+      output: z.object({ answer: z.string() }),
+      requests: {
+        ask: {
+          schemas: { input: z.object({}), output: z.string() },
+          model: "m",
+          prompt: () => "q",
+        },
+      },
+    });
+
+    const machine = agent.createMachine({
+      context: { answer: null },
+      initial: "asking",
+      states: {
+        asking: {
+          invoke: {
+            src: "ask",
+            input: () => ({}),
+            onDone: ({ output }) => ({ target: "done", context: { answer: output.result } }),
+          },
+        },
+        done: { type: "final", output: ({ context }) => ({ answer: context.answer ?? "" }) },
+      },
+    });
+
+    const raws: unknown[] = [];
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        onResult: (_request, { raw }) => raws.push(raw),
+        executors: {
+          generateText: async () => ({
+            result: "42",
+            usage: { inputTokens: 7, outputTokens: 3 },
+            finishReason: "stop",
+          }),
+        },
+      }),
+    );
+
+    expect(result.status).toBe("done");
+    expect(raws).toEqual([
+      { result: "42", usage: { inputTokens: 7, outputTokens: 3 }, finishReason: "stop" },
+    ]);
+  });
+
+  test("reasoning on the raw executor result reaches onResult.raw and the request.end trace", async () => {
+    const agent = setupAgent({
+      context: z.object({ answer: z.string().nullable() }),
+      output: z.object({ answer: z.string() }),
+      requests: {
+        ask: {
+          schemas: { input: z.object({}), output: z.object({ answer: z.string() }) },
+          model: "m",
+          includeReasoning: true,
+          prompt: () => "q",
+        },
+      },
+    });
+
+    const machine = agent.createMachine({
+      context: { answer: null },
+      initial: "asking",
+      states: {
+        asking: {
+          invoke: {
+            src: "ask",
+            input: () => ({}),
+            onDone: ({ output }) => ({
+              target: "done",
+              context: { answer: output.result.answer },
+            }),
+          },
+        },
+        done: { type: "final", output: ({ context }) => ({ answer: context.answer ?? "" }) },
+      },
+    });
+
+    const raws: unknown[] = [];
+    const trace: AgentTraceEvent[] = [];
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        onResult: (_request, { raw }) => raws.push(raw),
+        onTrace: (event) => trace.push(event),
+        executors: {
+          // Executor surfaces reasoning alongside the (already-unwrapped) output —
+          // exactly what createAiSdkExecutors returns from the envelope.
+          generateText: async () => ({ result: { answer: "42" }, reasoning: "carefully" }),
+        },
+      }),
+    );
+
+    expect(result.status).toBe("done");
+    // reasoning stays out of machine context/output.
+    expect(result.status === "done" ? result.output : undefined).toEqual({ answer: "42" });
+    // reasoning reaches onResult via raw.
+    expect(raws).toEqual([{ result: { answer: "42" }, reasoning: "carefully" }]);
+    // reasoning is lifted onto the request.end trace event as a field.
+    const end = trace.find(
+      (event): event is Extract<AgentTraceEvent, { type: "request.end" }> =>
+        event.type === "request.end",
+    );
+    expect(end?.reasoning).toBe("carefully");
+  });
+});
+
+describe("inspect passthrough (system-wide visibility)", () => {
+  test("child machine transitions are observable with their actorRef, unlike onTransition", async () => {
+    const child = setupAgent({
+      context: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+    }).createMachine({
+      id: "child",
+      context: {},
+      initial: "working",
+      states: {
+        working: {
+          invoke: {
+            src: createAsyncLogic({ run: async () => "done" }),
+            onDone: { target: "finished" },
+          },
+        },
+        finished: { type: "final", output: () => ({ ok: true }) },
+      },
+    });
+
+    const parent = setupAgent({
+      context: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      actors: { child },
+    }).createMachine({
+      id: "parent",
+      context: {},
+      initial: "delegating",
+      states: {
+        delegating: {
+          invoke: {
+            src: "child",
+            onDone: { target: "done" },
+          },
+        },
+        done: { type: "final", output: () => ({ ok: true }) },
+      },
+    });
+
+    const rootTransitions: string[] = [];
+    const inspected: Array<{ actorId: string; value: unknown }> = [];
+
+    const result = await runToQuiescence(
+      createAgentRuntime(parent, {
+        onTransition: (snapshot) => rootTransitions.push(JSON.stringify(snapshot.value)),
+        inspect: (event) => {
+          if (event.type !== "@xstate.transition") return;
+          const snapshot = event.snapshot as { value?: unknown };
+          if (snapshot.value === undefined) return;
+          inspected.push({
+            actorId: (event.actorRef as { id?: string }).id ?? "",
+            value: snapshot.value,
+          });
+        },
+        executors: {
+          generateText: async () => ({ result: "" }),
+        },
+      }),
+    );
+
+    expect(result.status).toBe("done");
+    // onTransition saw only the root machine's states...
+    expect(rootTransitions).toEqual(['"delegating"', '"done"']);
+    // ...while inspect saw the invoked child machine's states too, attributed
+    // to the child's actorRef.
+    const childValues = inspected
+      .filter(
+        (entry) => entry.actorId !== "parent" && !rootTransitions.includes(`"${entry.value}"`),
+      )
+      .map((entry) => entry.value);
+    expect(childValues).toContain("working");
+    expect(childValues).toContain("finished");
+  });
+
+  test("inspect accepts an observer object ({ next }), like createActor", async () => {
+    const machine = setupAgent({
+      context: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+    }).createMachine({
+      id: "observed",
+      context: {},
+      initial: "working",
+      states: {
+        working: {
+          invoke: {
+            src: createAsyncLogic({ run: async () => "done" }),
+            onDone: { target: "finished" },
+          },
+        },
+        finished: { type: "final", output: () => ({ ok: true }) },
+      },
+    });
+
+    const seen: string[] = [];
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        // The observer shape ({ next }), not a function.
+        inspect: { next: (event) => seen.push(event.type) },
+        executors: { generateText: async () => ({ result: "" }) },
+      }),
+    );
+
+    expect(result.status).toBe("done");
+    expect(seen).toContain("@xstate.transition");
+  });
+});
+
+describe("Feature A: human waits settle idle once quiescent", () => {
+  test("the exported default recognizes root handlers and composes with custom waits", async () => {
+    const machine = setup({}).createMachine({
+      on: { CONTINUE: { target: ".done" } },
+      initial: "waiting",
+      states: {
+        waiting: {},
+        done: { type: "final" },
+      },
+    });
+    const actor = createActor(machine).start();
+    const snapshot = actor.getSnapshot();
+
+    expect(isAgentIdle(snapshot)).toBe(true);
+    expect(isAgentIdle(snapshot) || snapshot.hasTag("waiting-for-webhook")).toBe(true);
+    actor.stop();
+
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {},
+      }),
+    );
+    expect(result.status).toBe("idle");
+  });
+
+  test("a tagged wait state settles idle and resumes to done", async () => {
+    const agent = setupAgent({
+      context: z.object({}),
+      input: z.object({}),
+      output: z.object({ approved: z.boolean() }),
+      events: { APPROVE: z.object({}) },
+    });
+    const machine = agent.createMachine({
+      context: {},
+      initial: "reviewing",
+      states: {
+        reviewing: {
+          tags: ["awaiting-review"],
+          on: { APPROVE: { target: "done" } },
+        },
+        done: { type: "final", output: () => ({ approved: true }) },
+      },
+    });
+
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText: async () => ({ result: {} }),
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+    expect(first.status).toBe("idle");
+    if (first.status !== "idle") throw new Error("expected idle");
+    expect(first.snapshot.value).toBe("reviewing");
+
+    const second = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText: async () => ({ result: {} }),
+        },
+      }),
+      {
+        snapshot: first.persist(),
+        event: { type: "APPROVE" },
+      },
+    );
+    expect(second.status).toBe("done");
+    expect(second.status === "done" ? second.output : undefined).toEqual({ approved: true });
+  });
+
+  test("a declared-suspension settle preserves invoked-child context written during the settling flush", async () => {
+    // Regression: the settle-triggering root event comes FROM the invoked
+    // child (child → parent), and the parent's handler sendTo's the child
+    // back while the child's mailbox is mid-flush. A synchronous settle in
+    // the inspect handler captured (and stopped) the child before that
+    // delivery, so the persisted snapshot lost the child's context update.
+    const childAgent = setupAgent({
+      context: z.object({ notes: z.array(z.string()) }),
+      events: {
+        OBSERVE: z.object({ note: z.string() }),
+        POKE: z.object({}),
+      },
+      requests: {
+        tick: {
+          schemas: { input: z.object({}), output: z.string() },
+          model: "m",
+          prompt: () => "tick",
+        },
+      },
+    });
+    const childMachine = childAgent.createMachine({
+      id: "note-taker",
+      context: { notes: [] },
+      on: {
+        OBSERVE: ({ context, event }) => ({
+          context: { notes: [...context.notes, event.note] },
+        }),
+      },
+      initial: "boot",
+      states: {
+        boot: {
+          // Child-initiated event, sent as an action while the child is
+          // processing its invoke's done event — so the child's own mailbox
+          // flush is the active one when the parent handles READY.
+          invoke: {
+            src: "tick",
+            input: {},
+            onDone: ({ parent }, enq) => {
+              if (parent) enq.sendTo(parent, { type: "READY" });
+              return { target: "watching" };
+            },
+          },
+        },
+        watching: {
+          on: {
+            POKE: { target: "boot" },
+          },
+        },
+      },
+    });
+
+    const agent = setupAgent({
+      context: z.object({ readies: z.number() }),
+      input: z.object({}),
+      events: {
+        READY: z.object({}),
+        CONTINUE: z.object({}),
+      },
+      actors: { child: childMachine },
+    });
+    const machine = agent.createMachine({
+      context: { readies: 0 },
+      initial: "running",
+      states: {
+        running: {
+          invoke: { id: "child", src: "child" },
+          initial: "starting",
+          states: {
+            starting: {
+              on: {
+                READY: ({ context, children }, enq) => {
+                  enq.sendTo(children.child, {
+                    type: "OBSERVE",
+                    note: `ready-${context.readies + 1}`,
+                  });
+                  return { target: "waiting", context: { readies: context.readies + 1 } };
+                },
+              },
+            },
+            waiting: {
+              tags: ["waiting"],
+              on: {
+                CONTINUE: ({ children }, enq) => {
+                  enq.sendTo(children.child, { type: "POKE" });
+                  return { target: "starting" };
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    const executors = { generateText: async () => ({ result: "tick" }) };
+
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors,
+      }),
+      {
+        input: {},
+      },
+    );
+    expect(first.status).toBe("idle");
+    if (first.status !== "idle") throw new Error("expected idle");
+    const persistedNotes = (
+      first.persist() as {
+        children?: { child?: { snapshot?: { context?: { notes?: string[] } } } };
+      }
+    ).children?.child?.snapshot?.context?.notes;
+    expect(persistedNotes).toEqual(["ready-1"]);
+
+    // Resume from the persisted snapshot: the child keeps accumulating.
+    const second = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors,
+      }),
+      {
+        snapshot: first.persist(),
+        event: { type: "CONTINUE" },
+      },
+    );
+    expect(second.status).toBe("idle");
+    if (second.status !== "idle") throw new Error("expected idle");
+    const secondNotes = (
+      second.persist() as {
+        children?: { child?: { snapshot?: { context?: { notes?: string[] } } } };
+      }
+    ).children?.child?.snapshot?.context?.notes;
+    expect(secondNotes).toEqual(["ready-1", "ready-2"]);
+  });
+
+  test("a declared-suspension settle keeps every child delivery queued across an always-chain into the wait state", async () => {
+    // Regression (game-loop shape): the child-originated event lands on a
+    // handler that targets a transient state whose `always` fires a SECOND
+    // sendTo to the child before resting in the tagged wait state — both
+    // deliveries are still in the child's mailbox when the root transition
+    // inspect fires, and both must be flushed before the idle persist.
+    const childAgent = setupAgent({
+      context: z.object({ notes: z.array(z.string()) }),
+      events: {
+        OBSERVE: z.object({ note: z.string() }),
+      },
+      requests: {
+        tick: {
+          schemas: { input: z.object({}), output: z.string() },
+          model: "m",
+          prompt: () => "tick",
+        },
+      },
+    });
+    const childMachine = childAgent.createMachine({
+      id: "observer",
+      context: { notes: [] },
+      on: {
+        OBSERVE: ({ context, event }) => ({
+          context: { notes: [...context.notes, event.note] },
+        }),
+      },
+      initial: "boot",
+      states: {
+        boot: {
+          invoke: {
+            src: "tick",
+            input: {},
+            onDone: ({ parent }, enq) => {
+              if (parent) enq.sendTo(parent, { type: "MOVED" });
+              return { target: "watching" };
+            },
+          },
+        },
+        watching: {},
+      },
+    });
+
+    const agent = setupAgent({
+      context: z.object({}),
+      input: z.object({}),
+      events: {
+        MOVED: z.object({}),
+        DONE: z.object({}),
+      },
+      actors: { child: childMachine },
+    });
+    const machine = agent.createMachine({
+      context: {},
+      initial: "running",
+      states: {
+        running: {
+          invoke: { id: "child", src: "child" },
+          initial: "playing",
+          states: {
+            playing: {
+              on: {
+                MOVED: ({ children }, enq) => {
+                  enq.sendTo(children.child, { type: "OBSERVE", note: "moved" });
+                  return { target: "over" };
+                },
+              },
+            },
+            over: {
+              always: ({ children }, enq) => {
+                enq.sendTo(children.child, { type: "OBSERVE", note: "round-over" });
+                return { target: "asking" };
+              },
+            },
+            asking: {
+              tags: ["waiting"],
+              on: { DONE: { target: "#end" } },
+            },
+          },
+        },
+        end: { id: "end", type: "final", output: () => ({}) },
+      },
+    });
+
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: { generateText: async () => ({ result: "tick" }) },
+      }),
+      {
+        input: {},
+      },
+    );
+    expect(result.status).toBe("idle");
+    if (result.status !== "idle") throw new Error("expected idle");
+    const notes = (
+      result.persist() as {
+        children?: { child?: { snapshot?: { context?: { notes?: string[] } } } };
+      }
+    ).children?.child?.snapshot?.context?.notes;
+    expect(notes).toEqual(["moved", "round-over"]);
+  });
+
+  test("a suspended region does not settle early while a sibling still has work in flight", async () => {
+    const agent = setupAgent({
+      context: z.object({ summary: z.string().nullable() }),
+      input: z.object({}),
+      output: z.object({ summary: z.string() }),
+      events: { APPROVE: z.object({}) },
+      requests: {
+        summarize: {
+          schemas: { input: z.object({}), output: z.string() },
+          model: "m",
+          prompt: () => "summarize",
+        },
+      },
+    });
+    const machine = agent.createMachine({
+      context: { summary: null },
+      type: "parallel",
+      states: {
+        review: {
+          initial: "waiting",
+          states: {
+            waiting: { tags: ["awaiting-review"], on: { APPROVE: { target: "approved" } } },
+            approved: { type: "final" },
+          },
+        },
+        work: {
+          initial: "summarizing",
+          states: {
+            summarizing: {
+              invoke: {
+                id: "sum",
+                src: "summarize",
+                input: {},
+                onDone: ({ output }) => ({
+                  target: "summarized",
+                  context: { summary: output.result },
+                }),
+              },
+            },
+            summarized: { type: "final" },
+          },
+        },
+      },
+    });
+
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText: () =>
+            new Promise((res) => setTimeout(() => res({ result: "done-summary" }), 10)),
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("idle");
+    if (result.status !== "idle") throw new Error("expected idle");
+    expect((result.snapshot.context as { summary: string | null }).summary).toBe("done-summary");
+  });
+
+  test("a resting state with an event handler is idle by default", async () => {
+    const agent = setupAgent({
+      context: z.object({}),
+      input: z.object({}),
+      output: z.object({}),
+      events: { GO: z.object({}) },
+    });
+    const machine = agent.createMachine({
+      context: {},
+      initial: "paused",
+      states: {
+        paused: { on: { GO: { target: "done" } } },
+        done: { type: "final", output: () => ({}) },
+      },
+    });
+
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText: async () => ({ result: {} }),
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("idle");
+    expect(result.status === "idle" ? result.snapshot.value : undefined).toBe("paused");
+  });
+
+  test("the machine-carried predicate survives machine.provide (executor rebinding)", async () => {
+    const agent = setupAgent({
+      context: z.object({}),
+      input: z.object({}),
+      output: z.object({}),
+      events: { GO: z.object({}) },
+      requests: {
+        noop: {
+          schemas: { input: z.object({}), output: z.string() },
+          model: "m",
+          prompt: () => "noop",
+        },
+      },
+    });
+    const machine = agent.createMachine({
+      context: {},
+      initial: "paused",
+      states: {
+        paused: { on: { GO: { target: "done" } } },
+        done: { type: "final", output: () => ({}) },
+      },
+    });
+
+    // A user-side provide returns a NEW machine object; the predicate is carried
+    // on the shared root `config`, so it must still be found.
+    const provided = machine.provide({});
+
+    const result = await runToQuiescence(
+      createAgentRuntime(provided, {
+        executors: {
+          generateText: async () => ({ result: "x" }),
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("idle");
+    expect(result.status === "idle" ? result.snapshot.value : undefined).toBe("paused");
+  });
+
+  test("untagged machines still settle idle via the fallback heuristic (unchanged)", async () => {
+    const agent = setupAgent({
+      context: z.object({}),
+      input: z.object({}),
+      output: z.object({}),
+      events: { APPROVE: z.object({}) },
+    });
+    const machine = agent.createMachine({
+      context: {},
+      initial: "reviewing",
+      states: {
+        // No tags, no custom detector — pure heuristic path.
+        reviewing: { on: { APPROVE: { target: "done" } } },
+        done: { type: "final", output: () => ({}) },
+      },
+    });
+
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText: async () => ({ result: {} }),
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+    expect(result.status).toBe("idle");
+    expect(result.status === "idle" ? result.snapshot.value : undefined).toBe("reviewing");
+  });
+});
+
+describe("Feature B: an event the state does not handle is ignored", () => {
+  const agent = setupAgent({
+    context: z.object({ ok: z.boolean() }),
+    input: z.object({}),
+    output: z.object({}),
+    events: {
+      APPROVE: z.object({}),
+      REJECT: z.object({ reason: z.string() }),
+      SUBMIT: z.object({}),
+    },
+  });
+  const machine = agent.createMachine({
+    context: { ok: false },
+    initial: "reviewing",
+    states: {
+      reviewing: {
+        on: {
+          APPROVE: { target: "done" },
+          REJECT: { target: "done" },
+          // Type-legal but guard-narrowed: rejected while ok === false.
+          SUBMIT: ({ context }) => (context.ok ? { target: "done" } : undefined),
+        },
+      },
+      done: { type: "final", output: () => ({}) },
+    },
+  });
+
+  const generateText = async () => ({ result: {} });
+
+  test("an event the restored state does not handle is ignored, not an error", async () => {
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: { generateText },
+      }),
+      {
+        input: {},
+      },
+    );
+    expect(first.status).toBe("idle");
+    if (first.status !== "idle") throw new Error("expected idle");
+
+    const second = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: { generateText },
+      }),
+      {
+        snapshot: first.persist(),
+        event: { type: "NOPE" } as never,
+      },
+    );
+
+    expect(second.status).toBe("idle");
+    expect(second.ignored).toEqual({ type: "NOPE" });
+    expect(second.status === "idle" ? second.snapshot.value : undefined).toBe("reviewing");
+  });
+
+  test("the trace marks the ignored event's transition", async () => {
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, { executors: { generateText } }),
+      {
+        input: {},
+      },
+    );
+    if (first.status !== "idle") throw new Error("expected idle");
+
+    const trace: AgentTraceEvent[] = [];
+    const runAgain = (event: { type: string }) =>
+      runToQuiescence(
+        createAgentRuntime(machine, {
+          executors: { generateText },
+          onTrace: (traceEvent) => trace.push(traceEvent),
+        }),
+        { snapshot: first.persist(), event: event as never },
+      );
+    await runAgain({ type: "NOPE" });
+    await runAgain({ type: "APPROVE" });
+
+    const transitions = trace.filter(
+      (event): event is Extract<AgentTraceEvent, { type: "machine.transition" }> =>
+        event.type === "machine.transition",
+    );
+    expect(transitions.map((event) => [event.event.type, event.ignored])).toEqual([
+      ["@xstate.init", undefined],
+      ["NOPE", true],
+      ["@xstate.init", undefined],
+      ["APPROVE", undefined],
+    ]);
+  });
+
+  test("an ignored event is still journaled, and replay ignores it again", async () => {
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: { generateText },
+      }),
+      {
+        input: {},
+      },
+    );
+    if (first.status !== "idle") throw new Error("expected idle");
+
+    const second = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: { generateText },
+      }),
+      {
+        events: first.events,
+        event: { type: "NOPE" } as never,
+      },
+    );
+    expect(second.ignored).toEqual({ type: "NOPE" });
+    expect(second.events.length).toBe(first.events.length + 1);
+    expect(second.events[second.events.length - 1]!.event.type).toBe("NOPE");
+
+    // Resuming from that log replays the ignored event without incident.
+    const third = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: { generateText },
+      }),
+      {
+        events: second.events,
+      },
+    );
+    expect(third.status).toBe("idle");
+    expect(third.ignored).toBeUndefined();
+  });
+
+  test("a handled event is not reported as ignored", async () => {
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: { generateText },
+      }),
+      {
+        input: {},
+      },
+    );
+    if (first.status !== "idle") throw new Error("expected idle");
+
+    const second = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: { generateText },
+      }),
+      {
+        snapshot: first.persist(),
+        event: { type: "APPROVE" },
+      },
+    );
+    expect(second.ignored).toBeUndefined();
+  });
+
+  test("a type-legal event a guard rejects does not throw (settles per normal semantics)", async () => {
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: { generateText },
+      }),
+      {
+        input: {},
+      },
+    );
+    if (first.status !== "idle") throw new Error("expected idle");
+
+    // SUBMIT is a declared, type-legal event; its guard rejects it here. This
+    // is not an error either: the machine takes no transition.
+    const second = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText,
+        },
+      }),
+      {
+        snapshot: first.persist(),
+        event: { type: "SUBMIT" },
+      },
+    );
+
+    expect(second.status).toBe("idle");
+    expect(second.status === "idle" ? second.snapshot.value : undefined).toBe("reviewing");
+  });
+});
+
+describe("runAgent error cause split", () => {
+  // Builds a decision machine whose `decide` always returns an unknown event,
+  // so resolveDecision exhausts its retries and throws AgentDecisionExhaustedError.
+  function exhaustingDecisionMachine(withOnError: boolean) {
+    const schemas = createAgentSchemas({
+      context: z.object({}),
+      input: z.object({}),
+      events: { ATTACK: z.object({}), HEAL: z.object({}) },
+    });
+    const chooseMove = createDecisionLogic({
+      model: "test-model",
+      prompt: "Choose a move.",
+      allowedEvents: ["ATTACK", "HEAL"] as const,
+    });
+    const agent = setupAgent({ schemas, actors: { chooseMove } });
+    return agent.createMachine({
+      context: {},
+      initial: "choosing",
+      states: {
+        choosing: {
+          invoke: {
+            id: "choosing",
+            src: "chooseMove",
+            input: {},
+            ...(withOnError ? { onError: { target: "fumbled" } } : {}),
+          },
+          on: { ATTACK: { target: "attacked" }, HEAL: { target: "healed" } },
+        },
+        attacked: { type: "final" },
+        healed: { type: "final" },
+        fumbled: { type: "final" },
+      },
+    });
+  }
+
+  const alwaysUnknown = async (): Promise<{ event: ChosenEvent }> => ({
+    event: { type: "BOGUS" },
+  });
+
+  test("unhandled AgentDecisionExhaustedError settles cause 'decision-exhausted'", async () => {
+    const result = await runToQuiescence(
+      createAgentRuntime(exhaustingDecisionMachine(false), {
+        executors: {
+          generateText: async () => ({ result: {} }),
+          decide: alwaysUnknown,
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.status === "error" ? result.cause : undefined).toBe("decision-exhausted");
+  });
+
+  test("a AgentDecisionExhaustedError handled by onError does NOT settle an error", async () => {
+    const result = await runToQuiescence(
+      createAgentRuntime(exhaustingDecisionMachine(true), {
+        executors: {
+          generateText: async () => ({ result: {} }),
+          decide: alwaysUnknown,
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    // onError routed it to the machine's final `fumbled` state, not a run error.
+    expect(result.status).not.toBe("error");
+    expect(result.snapshot.value).toBe("fumbled");
+  });
+
+  test("an inline agent.decide `maxRetries: 0` caps the live attempt budget at one", async () => {
+    // Regression: the runtime used to read the builtin logic's fixed
+    // `maxRetries: 2` and ignore the invoke input's own value.
+    const schemas = createAgentSchemas({
+      context: z.object({ amount: z.number() }),
+      input: z.object({ amount: z.number() }),
+      events: { ISSUE: z.object({}), REFUSE: z.object({}) },
+    });
+    const agent = setupAgent({ schemas });
+    const machine = agent.createMachine({
+      context: ({ input }) => input,
+      initial: "classifying",
+      states: {
+        classifying: {
+          invoke: {
+            id: "decide",
+            src: "agent.decide",
+            input: {
+              model: "test-model",
+              prompt: "Issue or refuse?",
+              allowedEvents: ["ISSUE", "REFUSE"] as const,
+              maxRetries: 0,
+            },
+            onError: { target: "refused" },
+          },
+          on: {
+            ISSUE: ({ context }) => (context.amount > 100 ? undefined : { target: "issued" }),
+            REFUSE: { target: "refused" },
+          },
+        },
+        issued: { type: "final" },
+        refused: { type: "final" },
+      },
+    });
+
+    let calls = 0;
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText: async () => ({ result: {} }),
+          decide: async () => {
+            calls += 1;
+            return { event: { type: "ISSUE" } }; // always guard-rejected
+          },
+        },
+      }),
+      { input: { amount: 5000 } },
+    );
+
+    expect(calls).toBe(1);
+    expect(result.status).not.toBe("error");
+    expect(result.snapshot.value).toBe("refused");
+  });
+
+  test("a plain executor throw (not decision-exhausted) still settles cause 'machine'", async () => {
+    const schemas = createAgentSchemas({
+      context: z.object({}),
+      input: z.object({}),
+      output: z.object({}),
+    });
+    const step = createTextLogic({
+      schemas: { input: z.object({}), output: z.object({}) },
+      model: "test-model",
+      prompt: "work",
+    });
+    const agent = setupAgent({ schemas, actors: { step } });
+    const machine = agent.createMachine({
+      context: {},
+      initial: "working",
+      states: {
+        working: { invoke: { id: "step", src: "step", input: {}, onDone: { target: "done" } } },
+        done: { type: "final" },
+      },
+    });
+
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText: async () => {
+            throw new Error("boom");
+          },
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.status === "error" ? result.cause : undefined).toBe("machine");
+  });
+});
+
+describe("runAgent dev-mode serialization guard", () => {
+  test("warns once, naming the path, when idle context holds a non-JSON value (Date)", async () => {
+    const schemas = createAgentSchemas({
+      context: z.object({ createdAt: z.date() }),
+      input: z.object({}),
+      events: { GO: z.object({}) },
+    });
+    const agent = setupAgent({ schemas });
+    const machine = agent.createMachine({
+      context: () => ({ createdAt: new Date() }),
+      initial: "waiting",
+      states: {
+        waiting: { on: { GO: { target: "done" } } },
+        done: { type: "final" },
+      },
+    });
+
+    const warnings: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    try {
+      const result = await runToQuiescence(
+        createAgentRuntime(machine, {
+          executors: {
+            generateText: async () => ({ result: {} }),
+          },
+        }),
+        {
+          input: {},
+        },
+      );
+      expect(result.status).toBe("idle");
+    } finally {
+      console.warn = original;
+    }
+
+    const serializationWarnings = warnings.filter((w) => w.includes("persist/resume"));
+    expect(serializationWarnings).toHaveLength(1);
+    expect(serializationWarnings[0]).toContain("context.createdAt (Date)");
+  });
+
+  test("does not warn when idle context is fully JSON-serializable", async () => {
+    const schemas = createAgentSchemas({
+      context: z.object({ topic: z.string() }),
+      input: z.object({}),
+      events: { GO: z.object({}) },
+    });
+    const agent = setupAgent({ schemas });
+    const machine = agent.createMachine({
+      context: () => ({ topic: "cats" }),
+      initial: "waiting",
+      states: {
+        waiting: { on: { GO: { target: "done" } } },
+        done: { type: "final" },
+      },
+    });
+
+    const warnings: string[] = [];
+    const original = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warnings.push(args.map(String).join(" "));
+    };
+    try {
+      await runToQuiescence(
+        createAgentRuntime(machine, {
+          executors: { generateText: async () => ({ result: {} }) },
+        }),
+        {
+          input: {},
+        },
+      );
+    } finally {
+      console.warn = original;
+    }
+
+    expect(warnings.filter((w) => w.includes("persist/resume"))).toHaveLength(0);
+  });
+});
+
+// ─── Snapshot version stamping + migrate hook (item 2) ───
+describe("restore semantics: pending requests and events-only resume", () => {
+  // Shared two-phase machine: a request, an idle gate, then a second request.
+  const buildMachine = () => {
+    const agentSetup = setupAgent({
+      context: z.object({ a: z.string().nullable(), b: z.string().nullable() }),
+      input: z.object({}),
+      output: z.object({ a: z.string(), b: z.string() }),
+      events: { GO: {} },
+    });
+    return agentSetup.createMachine({
+      context: () => ({ a: null, b: null }),
+      initial: "first",
+      states: {
+        first: {
+          invoke: {
+            src: "agent.generateText",
+            input: () => ({ model: "m", prompt: "one" }),
+            onDone: ({ event }) => ({
+              target: "waiting",
+              context: { a: String(event.output.result) },
+            }),
+          },
+        },
+        waiting: { on: { GO: { target: "second" } } },
+        second: {
+          invoke: {
+            src: "agent.generateText",
+            input: () => ({ model: "m", prompt: "two" }),
+            onDone: ({ event }) => ({
+              target: "done",
+              context: { b: String(event.output.result) },
+            }),
+          },
+        },
+        done: {
+          type: "final",
+          output: ({ context }) => ({ a: context.a ?? "", b: context.b ?? "" }),
+        },
+      },
+    });
+  };
+
+  test("a pending request round-trips through the persisted snapshot and re-executes idempotently on restore", async () => {
+    const machine = buildMachine();
+    const calls: string[] = [];
+
+    // Capture a mid-flight persisted snapshot with a hanging executor.
+    const bound = (await import("./index.js")).provideExecutors(machine, {
+      generateText: async (request) => {
+        calls.push(request.prompt ?? "");
+        return new Promise(() => {}) as never;
+      },
+    });
+    const actor = createActor(bound, { input: {} });
+    actor.start();
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    const persisted = actor.getPersistedSnapshot();
+    actor.stop();
+    expect(calls).toEqual(["one"]);
+
+    // JSON round-trip, then restore with a resolving executor: the pending
+    // request re-executes (XState restarts restored pending async logic).
+    const resolving = {
+      generateText: async (request: AgentTextRequest & { tools: AgentTools }) => {
+        calls.push(`retry:${request.prompt}`);
+        return { result: `ok:${request.prompt}` };
+      },
+    };
+    const restored = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: resolving,
+      }),
+      {
+        snapshot: JSON.parse(JSON.stringify(persisted)),
+      },
+    );
+    // First leg's call re-executed exactly once; run settled at the idle gate.
+    expect(calls).toEqual(["one", "retry:one"]);
+    expect(restored.status).toBe("idle");
+
+    const finished = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: resolving,
+      }),
+      {
+        snapshot: restored.persist(),
+        event: { type: "GO" },
+      },
+    );
+    expect(calls).toEqual(["one", "retry:one", "retry:two"]);
+    expect(finished.status).toBe("done");
+    expect(finished.status === "done" ? finished.output : undefined).toEqual({
+      a: "ok:one",
+      b: "ok:two",
+    });
+  });
+
+  test("executors receive runId and requestId correlation info", async () => {
+    const machine = buildMachine();
+    const seen: Array<{ runId?: string; requestId?: string }> = [];
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText: async (request, info) => {
+            seen.push({ runId: info?.runId, requestId: info?.requestId });
+            return { result: `ok:${request.prompt}` };
+          },
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+    expect(result.status).toBe("idle");
+    expect(seen).toHaveLength(1);
+    expect(seen[0]?.runId).toMatch(/^run_\d+$/);
+    expect(seen[0]?.requestId).toContain("first");
+  });
+});
+
+describe("machine version prop (createMachine({ version }))", () => {
+  const buildVersioned = (
+    version: string,
+    migrate?: (snapshot: Snapshot<unknown>, fromVersion: string | undefined) => Snapshot<unknown>,
+  ) => {
+    const agentSetup = setupAgent({
+      context: z.object({}),
+      input: z.object({}),
+      output: z.object({}),
+      events: { GO: {} },
+    });
+    return agentSetup.createMachine({
+      id: "versioned",
+      version,
+      ...(migrate ? { migrate } : {}),
+      context: () => ({}),
+      initial: "waiting",
+      states: {
+        waiting: { tags: ["waiting"], on: { GO: { target: "done" } } },
+        done: { type: "final", output: () => ({}) },
+      },
+    });
+  };
+
+  test("XState's persisted version resumes under the same machine", async () => {
+    const machine = buildVersioned("3");
+    const first = await runToQuiescence(createAgentRuntime(machine), {
+      input: {},
+    });
+    expect(first.status).toBe("idle");
+    const resumed = await runToQuiescence(createAgentRuntime(machine), {
+      snapshot: JSON.parse(JSON.stringify(first.persist())),
+      event: { type: "GO" },
+    });
+    expect(resumed.status).toBe("done");
+  });
+
+  test("a snapshot persisted under v1 refuses to resume under v2 (via the XState version field)", async () => {
+    const machineV1 = buildVersioned("1");
+    const first = await runToQuiescence(createAgentRuntime(machineV1), {
+      input: {},
+    });
+    expect(first.status).toBe("idle");
+    const persisted = JSON.parse(JSON.stringify(first.persist())) as Snapshot<unknown>;
+
+    const machineV2 = buildVersioned("2");
+    const mismatched = await runToQuiescence(createAgentRuntime(machineV2), {
+      snapshot: persisted,
+      event: { type: "GO" },
+    });
+    expect(mismatched.status).toBe("error");
+    expect(String(mismatched.status === "error" ? mismatched.error : "")).toMatch(
+      /does not match machine version/,
+    );
+
+    const migratingV2 = buildVersioned("2", (snapshot) => ({ ...snapshot, version: "2" }));
+    const migrated = await runToQuiescence(createAgentRuntime(migratingV2), {
+      snapshot: persisted,
+      event: { type: "GO" },
+    });
+    expect(migrated.status).toBe("done");
+  });
+});
+
+// ─── inspectTransitions (item 4) ───
+describe("inspectTransitions", () => {
+  test("observes an invoked child machine's transitions with its actorRef", async () => {
+    const childAgent = setupAgent({
+      context: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+    });
+    const childMachine = childAgent.createMachine({
+      id: "insp-child",
+      context: () => ({}),
+      output: () => ({ ok: true }),
+      initial: "childWorking",
+      states: {
+        childWorking: { always: { target: "childDone" } },
+        childDone: { type: "final" },
+      },
+    });
+    const parentAgent = setupAgent({
+      context: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      actors: { child: childMachine },
+    });
+    const parentMachine = parentAgent.createMachine({
+      id: "insp-parent",
+      context: () => ({}),
+      output: () => ({ ok: true }),
+      initial: "delegating",
+      states: {
+        delegating: { invoke: { id: "child", src: "child", onDone: { target: "done" } } },
+        done: { type: "final" },
+      },
+    });
+
+    const observed: Array<{ id: string; value: unknown }> = [];
+    const result = await runToQuiescence(
+      createAgentRuntime(parentMachine, {
+        inspect: inspectTransitions((snapshot, actorRef) => {
+          observed.push({ id: actorRef.id, value: snapshot.value });
+        }),
+        executors: {
+          generateText: async () => ({ result: {} }),
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("done");
+    expect(observed.some((entry) => entry.id === "child" && entry.value === "childDone")).toBe(
+      true,
+    );
+  });
+});
+
+describe("runAgent usage aggregation", () => {
+  const usageSchemas = createAgentSchemas({
+    context: z.object({ first: z.string().nullable(), second: z.string().nullable() }),
+    input: z.object({}),
+    output: z.object({ first: z.string(), second: z.string() }),
+    events: { APPROVE: z.object({}) },
+  });
+
+  const step = createTextLogic({
+    schemas: { input: z.object({ label: z.string() }), output: z.string() },
+    model: "test-model",
+    prompt: ({ input }) => input.label,
+  });
+
+  const usageAgent = setupAgent({ schemas: usageSchemas, actors: { step } });
+
+  // first -> second -> done: two sequential model calls.
+  const twoCallMachine = usageAgent.createMachine({
+    context: { first: null, second: null },
+    initial: "first",
+    states: {
+      first: {
+        invoke: {
+          id: "first",
+          src: "step",
+          input: { label: "one" },
+          onDone: ({ output }) => ({
+            target: "second",
+            context: { second: null, first: output.result },
+          }),
+        },
+      },
+      second: {
+        invoke: {
+          id: "second",
+          src: "step",
+          input: { label: "two" },
+          onDone: ({ output, context }) => ({
+            target: "done",
+            context: { first: context.first, second: output.result },
+          }),
+        },
+      },
+      done: {
+        type: "final",
+        output: ({ context }) => ({ first: context.first ?? "", second: context.second ?? "" }),
+      },
+    },
+  });
+
+  test("sums reported token usage across calls and counts modelCalls", async () => {
+    const result = await runToQuiescence(
+      createAgentRuntime(twoCallMachine, {
+        executors: {
+          generateText: async (request: AgentTextRequest & { tools: AgentTools }) => ({
+            result: `out:${request.prompt}`,
+            usage: {
+              inputTokens: 10,
+              outputTokens: 4,
+              totalTokens: 14,
+              reasoningTokens: 2,
+              cachedInputTokens: 1,
+            },
+          }),
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("done");
+    expect(result.usage).toEqual({
+      inputTokens: 20,
+      outputTokens: 8,
+      totalTokens: 28,
+      reasoningTokens: 4,
+      cachedInputTokens: 2,
+      modelCalls: 2,
+    });
+  });
+
+  test("partial usage: fields are summed over the calls that reported them", async () => {
+    let call = 0;
+    const result = await runToQuiescence(
+      createAgentRuntime(twoCallMachine, {
+        executors: {
+          generateText: async () => {
+            call += 1;
+            // Only the FIRST call reports usage, and only two fields of it.
+            return call === 1
+              ? { result: "a", usage: { inputTokens: 5, totalTokens: 6 } }
+              : { result: "b" };
+          },
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("done");
+    // `outputTokens` was never reported by ANY call, so it stays undefined;
+    // reported fields are sums over the reporting subset.
+    expect(result.usage).toEqual({ inputTokens: 5, totalTokens: 6, modelCalls: 2 });
+    expect(result.usage.outputTokens).toBeUndefined();
+  });
+
+  test("counts model calls even when no executor reports usage", async () => {
+    const result = await runToQuiescence(
+      createAgentRuntime(twoCallMachine, {
+        executors: { generateText: async () => ({ result: "x" }) },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.usage).toEqual({ modelCalls: 2 });
+  });
+
+  test("idle result carries the usage of the calls made before the pause", async () => {
+    const idleMachine = usageAgent.createMachine({
+      context: { first: null, second: null },
+      initial: "first",
+      states: {
+        first: {
+          invoke: {
+            id: "first",
+            src: "step",
+            input: { label: "one" },
+            onDone: ({ output }) => ({
+              target: "waiting",
+              context: { second: null, first: output.result },
+            }),
+          },
+        },
+        waiting: { on: { APPROVE: { target: "done" } } },
+        done: {
+          type: "final",
+          output: ({ context }) => ({ first: context.first ?? "", second: "" }),
+        },
+      },
+    });
+
+    const result = await runToQuiescence(
+      createAgentRuntime(idleMachine, {
+        executors: {
+          generateText: async () => ({
+            result: "drafted",
+            usage: { inputTokens: 9, outputTokens: 3 },
+          }),
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("idle");
+    expect(result.usage).toEqual({ inputTokens: 9, outputTokens: 3, modelCalls: 1 });
+
+    // A resumed run counts only ITS OWN calls, not the prior run's.
+    const resumed = await runToQuiescence(
+      createAgentRuntime(idleMachine, {
+        executors: { generateText: async () => ({ result: "unused" }) },
+      }),
+      {
+        snapshot: result.persist(),
+        event: { type: "APPROVE" },
+      },
+    );
+    expect(resumed.status).toBe("done");
+    expect(resumed.usage).toEqual({ modelCalls: 0 });
+  });
+
+  test("error result carries the usage of the calls made before the failure", async () => {
+    const result = await runToQuiescence(
+      createAgentRuntime(twoCallMachine, {
+        maxModelCalls: 1,
+        executors: {
+          generateText: async () => ({ result: "a", usage: { inputTokens: 11, totalTokens: 12 } }),
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.status === "error" ? result.cause : undefined).toBe("max-model-calls");
+    // The over-budget call never reached the executor, so it is not counted.
+    expect(result.usage).toEqual({ inputTokens: 11, totalTokens: 12, modelCalls: 1 });
+  });
+
+  test("decide usage is aggregated, and each retry counts as its own call", async () => {
+    const decideSchemas = createAgentSchemas({
+      context: z.object({}),
+      input: z.object({}),
+      output: z.object({}),
+      events: { GO: z.object({}) },
+    });
+    const pick = createDecisionLogic({
+      model: "test-model",
+      prompt: "choose",
+      allowedEvents: ["GO"],
+    });
+    const decideAgent = setupAgent({ schemas: decideSchemas, actors: { pick } });
+    const decideMachine = decideAgent.createMachine({
+      context: {},
+      initial: "deciding",
+      states: {
+        deciding: {
+          invoke: { id: "pick", src: "pick", input: {} },
+          on: { GO: { target: "done" } },
+        },
+        done: { type: "final" },
+      },
+    });
+
+    let attempt = 0;
+    const result = await runToQuiescence(
+      createAgentRuntime(decideMachine, {
+        executors: {
+          decide: async () => {
+            attempt += 1;
+            return attempt === 1
+              ? // First attempt picks an illegal event -> retried.
+                { event: { type: "NOPE" } as ChosenEvent, usage: { inputTokens: 3 } }
+              : {
+                  event: { type: "GO" } as ChosenEvent,
+                  usage: { inputTokens: 4, outputTokens: 1 },
+                };
+          },
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(result.status).toBe("done");
+    expect(result.usage).toEqual({ inputTokens: 7, outputTokens: 1, modelCalls: 2 });
+  });
+
+  test("per-call usage rides the request.end trace event", async () => {
+    const trace: AgentTraceEvent<typeof twoCallMachine>[] = [];
+    await runToQuiescence(
+      createAgentRuntime(twoCallMachine, {
+        onTrace: (event) => trace.push(event),
+        executors: {
+          generateText: async () => ({ result: "x", usage: { inputTokens: 2, outputTokens: 1 } }),
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    const ends = trace.filter((event) => event.type === "request.end");
+    expect(ends).toHaveLength(2);
+    for (const end of ends) {
+      expect(end).toHaveProperty("usage", { inputTokens: 2, outputTokens: 1 });
+    }
+  });
+
+  test("the call's finishReason rides the request.end trace event, normalized", async () => {
+    const trace: AgentTraceEvent<typeof twoCallMachine>[] = [];
+    await runToQuiescence(
+      createAgentRuntime(twoCallMachine, {
+        onTrace: (event) => trace.push(event),
+        executors: {
+          // A provider `'error'` is not a member of the portable union (the cast
+          // is what an un-normalizing host would need), so it lands on `'other'`.
+          generateText: async ({ prompt }) =>
+            ({
+              result: "x",
+              finishReason: prompt === "one" ? "length" : "error",
+            }) as AgentRequestExecutorResult<string>,
+        },
+      }),
+      {
+        input: {},
+      },
+    );
+
+    expect(
+      trace.filter((event) => event.type === "request.end").map((end) => end.finishReason),
+    ).toEqual(["length", "other"]);
+
+    // And it survives the JSON projection.
+    const end = trace.find((event) => event.type === "request.end")!;
+    expect(serializeTraceEvent(end as AgentTraceEvent)).toHaveProperty("finishReason", "length");
+  });
+});
+
+describe("machine input validation", () => {
+  // A machine whose input schema defaults every field except `topic`, and whose
+  // context simply mirrors what the factory was handed.
+  const buildMachine = () =>
+    setupAgent({
+      schemas: createAgentSchemas({
+        context: z.object({ topic: z.string(), rounds: z.number(), tone: z.string() }),
+        input: z.object({
+          topic: z.string(),
+          rounds: z.number().default(3),
+          tone: z.string().default("neutral"),
+        }),
+        output: z.object({ topic: z.string(), rounds: z.number(), tone: z.string() }),
+      }),
+    }).createMachine({
+      id: "input-defaults",
+      context: ({ input }) => ({ topic: input.topic, rounds: input.rounds, tone: input.tone }),
+      initial: "done",
+      states: {
+        done: {
+          type: "final",
+          output: ({ context }) => context,
+        },
+      },
+    });
+
+  test("fills schema defaults before the context factory runs", async () => {
+    const result = await runToQuiescence(createAgentRuntime(buildMachine()), {
+      input: { topic: "otters" },
+    });
+
+    expect(result.status).toBe("done");
+    if (result.status !== "done") throw new Error("expected done");
+    // `rounds`/`tone` were never passed; the schema supplied them.
+    expect(result.output).toEqual({ topic: "otters", rounds: 3, tone: "neutral" });
+  });
+
+  test("defaulted fields are optional at the call site, required ones are not", async () => {
+    // Compile-time half: `{ topic }` alone type-checks above because `rounds`
+    // and `tone` are defaulted, while `topic` (no default) stays required.
+    await expect(
+      runToQuiescence(createAgentRuntime(buildMachine()), {
+        // @ts-expect-error `topic` has no default, so it cannot be omitted
+        input: { rounds: 1 },
+      }),
+    ).rejects.toThrow(AgentError);
+  });
+
+  test("explicit values win over defaults", async () => {
+    const result = await runToQuiescence(createAgentRuntime(buildMachine()), {
+      input: { topic: "otters", rounds: 9 },
+    });
+
+    if (result.status !== "done") throw new Error("expected done");
+    expect(result.output).toEqual({ topic: "otters", rounds: 9, tone: "neutral" });
+  });
+
+  test("schema defaults reach the machine context", async () => {
+    const result = await runToQuiescence(createAgentRuntime(buildMachine()), {
+      input: { topic: "otters" },
+    });
+    expect(result.snapshot.context).toEqual({ topic: "otters", rounds: 3, tone: "neutral" });
+  });
+
+  test("invalid input rejects with an AgentError, like a bad resume snapshot", async () => {
+    // Thrown, not settled: the actor never starts, so this is a bad call rather
+    // than a machine failure.
+    await expect(
+      runToQuiescence(createAgentRuntime(buildMachine()), {
+        // `rounds` is not a number.
+        input: { topic: "otters", rounds: "nine" } as never,
+      }),
+    ).rejects.toThrow(AgentError);
+
+    const error: unknown = await runToQuiescence(createAgentRuntime(buildMachine()), {
+      input: { topic: "otters", rounds: "nine" } as never,
+    }).catch((caught: unknown) => caught);
+    expect((error as AgentError).code).toBe("invalid-machine-input");
+  });
+
+  test("omitted input stays omitted rather than being validated as {}", async () => {
+    // A machine that tolerates no input at all: omitting it must not start
+    // failing just because a schema with required fields is declared.
+    const machine = setupAgent({
+      schemas: createAgentSchemas({
+        context: z.object({ topic: z.string() }),
+        input: z.object({ topic: z.string() }),
+        output: z.object({ topic: z.string() }),
+      }),
+    }).createMachine({
+      id: "no-input",
+      context: ({ input }) => ({ topic: input?.topic ?? "(none)" }),
+      initial: "done",
+      states: { done: { type: "final", output: ({ context }) => context } },
+    });
+
+    const result = await runToQuiescence(createAgentRuntime(machine));
+
+    if (result.status !== "done") throw new Error("expected done");
+    expect(result.output).toEqual({ topic: "(none)" });
+  });
+
+  test("a machine with no declared input schema passes input through untouched", async () => {
+    const machine = setup({
+      schemas: { context: z.object({ seen: z.unknown() }) },
+    }).createMachine({
+      id: "plain",
+      context: ({ input }) => ({ seen: input }),
+      initial: "done",
+      states: { done: { type: "final", output: ({ context }) => context.seen } },
+    });
+
+    const result = await runToQuiescence(createAgentRuntime(machine), {
+      input: { anything: 1 } as never,
+    });
+
+    if (result.status !== "done") throw new Error("expected done");
+    expect(result.output).toEqual({ anything: 1 });
+  });
+});
+
+describe("runAgent event log", () => {
+  const answer = createTextLogic({ model: "test-model", prompt: () => "hello" });
+
+  /** asking --(model)--> waiting --APPROVE--> wrapping --(raised)--> done */
+  const makeLoggedMachine = (
+    overrides: { id?: string; version?: string; migrate?: (snapshot: unknown) => unknown } = {},
+  ) =>
+    setup({ actors: { answer } }).createMachine({
+      id: overrides.id ?? "logged",
+      ...(overrides.version !== undefined ? { version: overrides.version } : {}),
+      ...(overrides.migrate ? { migrate: overrides.migrate } : {}),
+      context: () => ({ answer: null as string | null }),
+      initial: "asking",
+      states: {
+        asking: {
+          invoke: {
+            id: "ask",
+            src: "answer",
+            input: () => ({}),
+            onDone: ({ output }: { output: { result: string } }) => ({
+              target: "waiting",
+              context: { answer: output.result },
+            }),
+          } as never,
+        },
+        waiting: { on: { APPROVE: { target: "wrapping" } } },
+        wrapping: {
+          entry: (_, enq) => enq.raise({ type: "CONTINUE" }),
+          on: { CONTINUE: { target: "done" } },
+        },
+        done: { type: "final", output: () => ({ ok: true }) },
+      },
+    });
+
+  const executors = () => ({
+    generateText: async () => ({ result: "42", usage: { totalTokens: 7 } }),
+  });
+
+  const types = (entries: readonly AgentLogEntry[]) => entries.map((entry) => entry.event.type);
+
+  test("metadata stamps the init entry, and a resume keeps the first run's stamp", async () => {
+    const machine = makeLoggedMachine();
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+        metadata: { policyVersion: "v3", executionId: "ignored" },
+      }),
+      { input: undefined },
+    );
+
+    expect(first.events[0]!.metadata).toMatchObject({ policyVersion: "v3" });
+    expect(getLogExecutionId(first.events)).not.toBe("ignored");
+
+    const second = await runToQuiescence(
+      createAgentRuntime(machine, { executors: executors(), metadata: { policyVersion: "v4" } }),
+      { events: first.events, snapshot: first.persist(), event: { type: "APPROVE" } as never },
+    );
+    expect(second.events[0]!.metadata).toMatchObject({ policyVersion: "v3" });
+  });
+
+  test("metadata changed after the runtime is created does not reach the log", async () => {
+    const metadata: Record<string, unknown> = { policyVersion: "v3" };
+    const runtime = createAgentRuntime(makeLoggedMachine(), {
+      executors: executors(),
+      metadata: metadata as never,
+    });
+    metadata.policyVersion = new Date();
+    const result = await runToQuiescence(runtime, { input: undefined });
+
+    expect(result.events[0]!.metadata).toMatchObject({ policyVersion: "v3" });
+  });
+
+  test("metadata that is not JSON throws before the run starts", () => {
+    expect(() =>
+      createAgentRuntime(makeLoggedMachine(), {
+        executors: executors(),
+        metadata: { at: new Date() as never },
+      }),
+    ).toThrow(/metadata/);
+  });
+
+  test("a fresh run yields a self-contained log of external inputs only", async () => {
+    const machine = makeLoggedMachine();
+    const streamed: AgentLogEntry[] = [];
+
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+        onEvent: (entry) => streamed.push(entry),
+      }),
+      {
+        input: undefined,
+      },
+    );
+
+    expect(first.status).toBe("idle");
+    // The reserved init entry comes first and names the lineage.
+    expect(first.events[0]!.event.type).toBe(AGENT_INIT_EVENT_TYPE);
+    expect(typeof getLogExecutionId(first.events)).toBe("string");
+    // External inputs are journaled: the invoke's completion and the reserved
+    // usage record. Nothing else — no `@xstate.init`.
+    expect(types(first.events)).toEqual([
+      AGENT_INIT_EVENT_TYPE,
+      AGENT_USAGE_EVENT_TYPE,
+      "xstate.done.actor",
+    ]);
+    // `onEvent` streamed exactly the same entries, in order, init first.
+    expect(streamed).toEqual(first.events);
+    // Every entry carries a verification hash, and the whole log folds back to
+    // the state the run reached.
+    expect(first.events.every((entry) => typeof entry.verification?.stateHash === "string")).toBe(
+      true,
+    );
+    const folded = replay(machine, first.events);
+    expect((folded.snapshot as AnyMachineSnapshot).matches("waiting")).toBe(true);
+
+    // Resuming continues the SAME log: same lineage, contiguous indices.
+    const second = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+      }),
+      {
+        events: first.events,
+        snapshot: first.persist(),
+        event: { type: "APPROVE" } as never,
+      },
+    );
+    expect(second.status).toBe("done");
+    expect(getLogExecutionId(second.events)).toBe(getLogExecutionId(first.events));
+    expect(second.events.map((entry) => entry.index)).toEqual(
+      second.events.map((_entry, index) => index),
+    );
+    // The host's APPROVE is journaled; the machine's own raised CONTINUE is not
+    // (replay re-derives it).
+    expect(types(second.events)).toContain("APPROVE");
+    expect(types(second.events)).not.toContain("CONTINUE");
+    expect(replay(machine, second.events).snapshot.status).toBe("done");
+  });
+
+  test("verification: false omits the recorded state hashes", async () => {
+    const machine = makeLoggedMachine();
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+        verification: false,
+      }),
+      {
+        input: undefined,
+      },
+    );
+    expect(result.events.length).toBeGreaterThan(1);
+    expect(result.events.every((entry) => entry.verification === undefined)).toBe(true);
+  });
+
+  test("events-only crash recovery: journaled calls are not re-run, and the in-flight call keeps its callKey", async () => {
+    const twoCallMachine = setup({ actors: { answer } }).createMachine({
+      id: "two-calls",
+      context: () => ({}),
+      initial: "a",
+      states: {
+        a: {
+          invoke: { id: "a", src: "answer", input: () => ({}), onDone: { target: "b" } } as never,
+        },
+        b: {
+          invoke: {
+            id: "b",
+            src: "answer",
+            input: () => ({}),
+            onDone: { target: "waiting" },
+          } as never,
+        },
+        waiting: { on: { GO: { target: "done" } } },
+        done: { type: "final" },
+      },
+    });
+
+    const firstCalls: Array<{ requestId?: string; callKey?: string }> = [];
+    // The crash is driven by the run itself, not by the clock: abort only once
+    // the second call is actually in flight.
+    const controller = new AbortController();
+    const inFlight = deferred();
+    const crashed = await (async () => {
+      const running = runToQuiescence(
+        createAgentRuntime(twoCallMachine, {
+          signal: controller.signal,
+          executors: {
+            generateText: async (_request, info) => {
+              firstCalls.push({ requestId: info?.requestId, callKey: info?.callKey });
+              if (firstCalls.length === 1) return { result: "one" };
+              // The second call is the one still in flight at the crash.
+              inFlight.resolve();
+              return await new Promise<never>(() => {});
+            },
+          },
+        }),
+        {
+          input: undefined,
+        },
+      );
+      await inFlight.promise;
+      controller.abort();
+      return running;
+    })();
+
+    expect(crashed.status).toBe("error");
+    expect(firstCalls.map((call) => call.requestId)).toEqual(["a", "b"]);
+    expect(types(crashed.events)).toContain("xstate.done.actor");
+
+    const secondCalls: Array<{ requestId?: string; callKey?: string }> = [];
+    const recovered = await runToQuiescence(
+      createAgentRuntime(twoCallMachine, {
+        executors: {
+          generateText: async (_request, info) => {
+            secondCalls.push({ requestId: info?.requestId, callKey: info?.callKey });
+            return { result: "two" };
+          },
+        },
+      }),
+      {
+        // Log only — no snapshot survived the crash.
+        events: crashed.events,
+      },
+    );
+
+    expect(recovered.status).toBe("idle");
+    // `a` completed before the crash and folds back in from the log.
+    expect(secondCalls.map((call) => call.requestId)).toEqual(["b"]);
+    // Identical key across the crash: an executor-level cache can dedupe it.
+    expect(secondCalls[0]!.callKey).toBe(firstCalls[1]!.callKey);
+    expect(secondCalls[0]!.callKey).toMatch(/^[0-9a-f-]+:b#1$/);
+  });
+
+  test("a forked thread's calls get their own callKeys, not the parent's", async () => {
+    const askMachine = setup({ actors: { answer } }).createMachine({
+      id: "ask-later",
+      context: () => ({}),
+      initial: "waiting",
+      states: {
+        waiting: { on: { GO: { target: "asking" } } },
+        asking: {
+          invoke: {
+            id: "ask",
+            src: "answer",
+            input: () => ({}),
+            onDone: { target: "done" },
+          } as never,
+        },
+        done: { type: "final" },
+      },
+    });
+    const store = createInMemoryEventLogStore();
+    const generateText = async () => ({ result: "ok" });
+    await runToQuiescence(
+      createAgentRuntime(askMachine, { store, threadId: "parent", executors: { generateText } }),
+      { input: undefined },
+    );
+    await store.fork({ threadId: "parent", newThreadId: "branch" });
+
+    const keyOf = async (threadId: string) => {
+      const keys: Array<string | undefined> = [];
+      await runToQuiescence(
+        createAgentRuntime(askMachine, {
+          store,
+          threadId,
+          executors: {
+            generateText: async (_request, info) => {
+              keys.push(info?.callKey);
+              return { result: "ok" };
+            },
+          },
+        }),
+        { event: { type: "GO" } },
+      );
+      return keys[0]!;
+    };
+    const [parentKey, branchKey] = [await keyOf("parent"), await keyOf("branch")];
+
+    const branchId = getLogExecutionId(await store.read("branch"))!;
+    expect(branchKey).toBe(`${branchId}:ask#1`);
+    expect(parentKey).toBe(`${getLogExecutionId(await store.read("parent"))}:ask#1`);
+    expect(branchKey).not.toBe(parentKey);
+  });
+
+  test("decision retries get distinct, replay-stable callKeys", async () => {
+    const schemas = createAgentSchemas({
+      context: z.object({}),
+      input: z.object({}),
+      events: { ATTACK: z.object({}) },
+    });
+    const chooseMove = createDecisionLogic({
+      model: "test-model",
+      prompt: "Choose a move.",
+      allowedEvents: ["ATTACK"] as const,
+    });
+    const agent = setupAgent({ schemas, actors: { chooseMove } });
+    const machine = agent.createMachine({
+      context: {},
+      initial: "choosing",
+      states: {
+        choosing: {
+          invoke: { id: "choosing", src: "chooseMove", input: {} },
+          on: { ATTACK: { target: "attacked" } },
+        },
+        attacked: { type: "final" },
+      },
+    });
+
+    const run = async () => {
+      const keys: Array<string | undefined> = [];
+      const result = await runToQuiescence(
+        createAgentRuntime(machine, {
+          executors: {
+            decide: async (request, info) => {
+              keys.push(info?.callKey);
+              // The first attempt picks an event that is not a candidate, so
+              // `resolveDecision` rejects it and retries with feedback.
+              return request.attempts.length === 0
+                ? { event: { type: "NOPE" } as never }
+                : { event: { type: "ATTACK" } as never };
+            },
+          },
+        }),
+        {
+          input: {},
+        },
+      );
+      return { keys, result };
+    };
+
+    const first = await run();
+    expect(first.result.status).toBe("done");
+    expect(first.keys).toHaveLength(2);
+    // Same invoke, same occurrence — but the attempt ordinal keeps a compliant
+    // cache from returning the rejected first attempt for the retry.
+    expect(first.keys[0]).toMatch(/^[0-9a-f-]+:choosing#\d+\.0$/);
+    expect(first.keys[1]).toBe(`${first.keys[0]!.slice(0, -2)}.1`);
+
+    // The ordinal comes from `request.attempts.length`, so re-executing an
+    // attempt derives the same key rather than a fresh one.
+    const second = await run();
+    expect(second.keys.map((key) => key?.split(":")[1])).toEqual(
+      first.keys.map((key) => key?.split(":")[1]),
+    );
+  });
+
+  test("resume precedence: a tail-stamped snapshot is trusted, a stale one is not", async () => {
+    const machine = makeLoggedMachine();
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+      }),
+      {
+        input: undefined,
+      },
+    );
+    const cached = JSON.parse(JSON.stringify(first.persist())) as Snapshot<unknown>;
+
+    // Corrupt a MIDDLE entry's recorded hash: replaying this log throws, so a
+    // resume that succeeds proves the cached snapshot was trusted as-is.
+    const poisoned = (JSON.parse(JSON.stringify(first.events)) as AgentLogEntry[]).map((entry) =>
+      entry.index === 1 ? { ...entry, verification: { stateHash: "deadbeef" } } : entry,
+    );
+    expect(() => replay(machine, poisoned)).toThrow(/Replay diverged/);
+
+    const fastPath = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+      }),
+      {
+        events: poisoned,
+        snapshot: cached,
+        event: { type: "APPROVE" } as never,
+      },
+    );
+    expect(fastPath.status).toBe("done");
+
+    // The same poisoned log with no cache to trust must replay — and throw.
+    await expect(
+      runToQuiescence(
+        createAgentRuntime(machine, {
+          executors: executors(),
+        }),
+        {
+          events: poisoned,
+        },
+      ),
+    ).rejects.toThrow(/Replay diverged/);
+  });
+
+  test("a stale snapshot loses to the log, and a divergent one throws", async () => {
+    const machine = makeLoggedMachine();
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+      }),
+      {
+        input: undefined,
+      },
+    );
+    const staleSnapshot = JSON.parse(JSON.stringify(first.persist())) as Snapshot<unknown>;
+    const second = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+      }),
+      {
+        events: first.events,
+        snapshot: staleSnapshot,
+        event: { type: "APPROVE" } as never,
+      },
+    );
+    expect(second.status).toBe("done");
+
+    // `staleSnapshot` caches index 3 of a log that is now 5 entries long. It
+    // still agrees with the log at index 3, so the log simply wins.
+    expect(second.events.length).toBeGreaterThan(first.events.length);
+    const resumedFromStale = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+      }),
+      {
+        events: second.events,
+        snapshot: staleSnapshot,
+      },
+    );
+    expect(resumedFromStale.status).toBe("done");
+
+    // A snapshot from another lineage that claims a position in THIS log is a
+    // host bug, not a resume.
+    const otherRun = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: { generateText: async () => ({ result: "different" }) },
+      }),
+      {
+        input: undefined,
+      },
+    );
+    await expect(
+      runToQuiescence(
+        createAgentRuntime(machine, {
+          executors: executors(),
+        }),
+        {
+          events: first.events,
+          snapshot: JSON.parse(JSON.stringify(otherRun.persist())) as Snapshot<unknown>,
+        },
+      ),
+    ).rejects.toBeInstanceOf(AgentSnapshotDivergedError);
+  });
+
+  test("version bridge: a snapshot opens a new log segment, and its absence throws", async () => {
+    const v1 = makeLoggedMachine({ version: "1" });
+    const first = await runToQuiescence(
+      createAgentRuntime(v1, {
+        executors: executors(),
+      }),
+      {
+        input: undefined,
+      },
+    );
+    expect(first.status).toBe("idle");
+    const persisted = JSON.parse(JSON.stringify(first.persist())) as Snapshot<unknown>;
+
+    const v2 = makeLoggedMachine({
+      version: "2",
+      migrate: (snapshot) => ({ ...(snapshot as object), version: "2" }),
+    });
+
+    const bridged = await runToQuiescence(
+      createAgentRuntime(v2, {
+        executors: executors(),
+        metadata: { policyVersion: "p2" },
+      }),
+      {
+        events: first.events,
+        snapshot: persisted,
+        event: { type: "APPROVE" } as never,
+      },
+    );
+    expect(bridged.status).toBe("done");
+    const init = bridged.events[0]!;
+    expect(init.event.type).toBe(AGENT_INIT_EVENT_TYPE);
+    expect((init.event as { snapshot?: unknown }).snapshot).toBeDefined();
+    expect(init.machineVersion).toBe("2");
+    expect(init.metadata?.executionId).toBe(getLogExecutionId(first.events));
+    expect(init.metadata?.migratedFrom).toEqual({
+      machineVersion: "1",
+      logIndex: first.events.length,
+    });
+    // The new segment is stamped by the run that opened it.
+    expect(init.metadata?.policyVersion).toBe("p2");
+
+    await expect(
+      runToQuiescence(
+        createAgentRuntime(v2, {
+          executors: executors(),
+        }),
+        {
+          events: first.events,
+        },
+      ),
+    ).rejects.toBeInstanceOf(AgentMachineVersionMismatchError);
+  });
+
+  test("version bridge: only the log's own tail snapshot is accepted", async () => {
+    const v1 = makeLoggedMachine({ version: "1" });
+    const first = await runToQuiescence(
+      createAgentRuntime(v1, {
+        executors: executors(),
+      }),
+      {
+        input: undefined,
+      },
+    );
+    const tailOfFirst = JSON.parse(JSON.stringify(first.persist())) as Snapshot<unknown>;
+
+    // The thread moves on, so `tailOfFirst` now caches an INTERIOR index.
+    const second = await runToQuiescence(
+      createAgentRuntime(v1, {
+        executors: executors(),
+      }),
+      {
+        events: first.events,
+        snapshot: tailOfFirst,
+        event: { type: "APPROVE" } as never,
+      },
+    );
+    expect(second.events.length).toBeGreaterThan(first.events.length);
+
+    const v2 = makeLoggedMachine({
+      version: "2",
+      migrate: (snapshot) => ({ ...(snapshot as object), version: "2" }),
+    });
+
+    // Bridging with it would roll the thread back past logged entries.
+    await expect(
+      runToQuiescence(
+        createAgentRuntime(v2, {
+          executors: executors(),
+        }),
+        {
+          events: second.events,
+          snapshot: tailOfFirst,
+        },
+      ),
+    ).rejects.toBeInstanceOf(AgentSnapshotDivergedError);
+
+    // Right index, wrong state: the tail entry's recorded hash catches it.
+    const tampered = JSON.parse(JSON.stringify(first.persist())) as Snapshot<unknown> & {
+      context: { answer: string };
+    };
+    tampered.context.answer = "tampered";
+    await expect(
+      runToQuiescence(
+        createAgentRuntime(v2, {
+          executors: executors(),
+        }),
+        {
+          events: first.events,
+          snapshot: tampered,
+        },
+      ),
+    ).rejects.toBeInstanceOf(AgentSnapshotDivergedError);
+
+    // The genuine tail still bridges.
+    const bridged = await runToQuiescence(
+      createAgentRuntime(v2, {
+        executors: executors(),
+      }),
+      {
+        events: first.events,
+        snapshot: tailOfFirst,
+        event: { type: "APPROVE" } as never,
+      },
+    );
+    expect(bridged.status).toBe("done");
+  });
+
+  test("version bridge: a fork bridges with its parent's snapshot until it moves on", async () => {
+    const v1 = makeLoggedMachine({ version: "1" });
+    const parent = await runToQuiescence(createAgentRuntime(v1, { executors: executors() }), {
+      input: undefined,
+    });
+    const parentTail = JSON.parse(JSON.stringify(parent.persist())) as Snapshot<unknown>;
+    const forked = forkEventLog(parent.events, parent.events.length);
+    const v2 = makeLoggedMachine({
+      version: "2",
+      migrate: (snapshot) => ({ ...(snapshot as object), version: "2" }),
+    });
+
+    // Untouched since the cutoff: the parent's tail snapshot is the fork's tail too.
+    const bridged = await runToQuiescence(createAgentRuntime(v2, { executors: executors() }), {
+      events: forked,
+      snapshot: parentTail,
+      event: { type: "APPROVE" } as never,
+    });
+    expect(bridged.status).toBe("done");
+    expect(getLogExecutionId(bridged.events)).toBe(getLogExecutionId(forked));
+
+    // Once the fork appends, the parent's snapshot no longer caches its tail.
+    const moved = await runToQuiescence(createAgentRuntime(v1, { executors: executors() }), {
+      events: forked,
+      event: { type: "APPROVE" } as never,
+    });
+    expect(moved.events.length).toBeGreaterThan(forked.length);
+    await expect(
+      runToQuiescence(createAgentRuntime(v2, { executors: executors() }), {
+        events: moved.events,
+        snapshot: parentTail,
+      }),
+    ).rejects.toBeInstanceOf(AgentMachineVersionMismatchError);
+  });
+
+  test("a parent's log passed as a fork thread's `events` is refused", async () => {
+    const machine = makeLoggedMachine({ version: "1" });
+    const store = createInMemoryEventLogStore();
+    const parent = await runToQuiescence(
+      createAgentRuntime(machine, { store, threadId: "parent", executors: executors() }),
+      { input: undefined },
+    );
+    await store.fork({ threadId: "parent", newThreadId: "branch" });
+
+    await expect(
+      runToQuiescence(
+        createAgentRuntime(machine, { store, threadId: "branch", executors: executors() }),
+        { events: parent.events },
+      ),
+    ).rejects.toMatchObject({ code: "event-log-conflict" });
+  });
+
+  test("a log written by another machine is never a resume", async () => {
+    const machine = makeLoggedMachine({ version: "1" });
+    const other = makeLoggedMachine({ version: "1", id: "other-logged" });
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+      }),
+      {
+        input: undefined,
+      },
+    );
+
+    // Same version, different artifact: the entries fold against states this
+    // machine does not have.
+    await expect(
+      runToQuiescence(
+        createAgentRuntime(other, {
+          executors: executors(),
+        }),
+        {
+          events: first.events,
+          snapshot: JSON.parse(JSON.stringify(first.persist())) as Snapshot<unknown>,
+          event: { type: "APPROVE" } as never,
+        },
+      ),
+    ).rejects.toBeInstanceOf(AgentMachineVersionMismatchError);
+  });
+
+  test("an unverified log outranks a snapshot that merely claims to cache it", async () => {
+    const machine = makeLoggedMachine();
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+        verification: false,
+      }),
+      {
+        input: undefined,
+      },
+    );
+    expect(first.events.every((entry) => entry.verification === undefined)).toBe(true);
+
+    // Correct `agentMeta`, wrong state: with no recorded hash to check it
+    // against, the log is replayed rather than the snapshot trusted.
+    const tampered = JSON.parse(JSON.stringify(first.persist())) as Snapshot<unknown> & {
+      context: { answer: string };
+    };
+    tampered.context.answer = "tampered";
+    const resumed = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+        verification: false,
+      }),
+      {
+        events: first.events,
+        snapshot: tampered,
+        event: { type: "APPROVE" } as never,
+      },
+    );
+    expect(resumed.status).toBe("done");
+    expect((resumed.snapshot as AnyMachineSnapshot).context).toEqual({ answer: "42" });
+  });
+
+  test("snapshot-only resume starts a replayable log from that snapshot", async () => {
+    const machine = makeLoggedMachine();
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+      }),
+      {
+        input: undefined,
+      },
+    );
+    const second = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+      }),
+      {
+        snapshot: JSON.parse(JSON.stringify(first.persist())) as Snapshot<unknown>,
+        event: { type: "APPROVE" } as never,
+      },
+    );
+    expect(second.status).toBe("done");
+    expect(second.events[0]!.event.type).toBe(AGENT_INIT_EVENT_TYPE);
+    expect((second.events[0]!.event as { snapshot?: unknown }).snapshot).toBeDefined();
+    // A NEW lineage: the snapshot carried no log with it.
+    expect(getLogExecutionId(second.events)).not.toBe(getLogExecutionId(first.events));
+    expect(replay(machine, second.events).snapshot.status).toBe("done");
+  });
+
+  test("usage is journaled even when the machine declares no transition for it, and result.usage folds the log", async () => {
+    const machine = makeLoggedMachine();
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText: async () => ({ result: "42", usage: { totalTokens: 7, inputTokens: 3 } }),
+        },
+      }),
+      {
+        input: undefined,
+      },
+    );
+    const usageEntries = result.events.filter(
+      (entry) => entry.event.type === AGENT_USAGE_EVENT_TYPE,
+    );
+    expect(usageEntries).toHaveLength(1);
+    expect(result.usage).toEqual({ totalTokens: 7, inputTokens: 3, modelCalls: 1 });
+    expect(getUsageFromEvents(result.events)).toEqual({ totalTokens: 7, inputTokens: 3 });
+    // The machine never reacted to it, so the log still folds cleanly.
+    expect(replay(machine, result.events).snapshot.status).toBe("active");
+  });
+
+  test("a call that settles after the run is still appended to the log", async () => {
+    const machine = makeLoggedMachine();
+    const streamed: AgentLogEntry[] = [];
+    const controller = new AbortController();
+    const inFlight = deferred();
+    const release = deferred();
+    const stragglerEntry = deferred<AgentLogEntry>();
+    let atSettle: number | undefined;
+
+    const running = runToQuiescence(
+      createAgentRuntime(machine, {
+        signal: controller.signal,
+        onEvent: (entry) => {
+          streamed.push(entry);
+          // Anything past the settle boundary is the straggler.
+          if (atSettle !== undefined && streamed.length > atSettle) {
+            stragglerEntry.resolve(entry);
+          }
+        },
+        executors: {
+          generateText: async () => {
+            inFlight.resolve();
+            await release.promise;
+            return { result: "late", usage: { totalTokens: 11 } };
+          },
+        },
+      }),
+      {
+        input: undefined,
+      },
+    );
+    await inFlight.promise;
+    controller.abort();
+    const result = await running;
+
+    expect(result.status).toBe("error");
+    atSettle = streamed.length;
+    expect(result.events).toHaveLength(atSettle);
+    release.resolve();
+    // The tokens were spent, so the record is appended (and streamed) even
+    // though the run had already returned.
+    const straggler = await stragglerEntry.promise;
+    expect(streamed.length).toBe(atSettle + 1);
+    expect(straggler.event.type).toBe(AGENT_USAGE_EVENT_TYPE);
+  });
+
+  test("timers are journaled and raised events are not; both round-trip through replay", async () => {
+    const timerMachine = setup({}).createMachine({
+      id: "timer-log",
+      context: () => ({}),
+      initial: "waiting",
+      states: {
+        waiting: { after: { 5: { target: "beeped" } } },
+        beeped: {
+          entry: (_, enq) => enq.raise({ type: "CONTINUE" }),
+          on: { CONTINUE: { target: "done" } },
+        },
+        done: { type: "final" },
+      },
+    });
+
+    const result = await runToQuiescence(
+      createAgentRuntime(timerMachine, {
+        executors: {},
+      }),
+      {
+        input: undefined,
+      },
+    );
+    expect(result.status).toBe("done");
+    expect(types(result.events)).toContain("xstate.timer");
+    expect(types(result.events)).not.toContain("CONTINUE");
+    expect(replay(timerMachine, result.events).snapshot.status).toBe("done");
+  });
+
+  test("a log whose last entry reached a final state settles immediately on resume", async () => {
+    const machine = makeLoggedMachine();
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+      }),
+      {
+        input: undefined,
+      },
+    );
+    const finished = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: executors(),
+      }),
+      {
+        events: first.events,
+        snapshot: first.persist(),
+        event: { type: "APPROVE" } as never,
+      },
+    );
+    expect(finished.status).toBe("done");
+
+    let called = 0;
+    const replayed = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {
+          generateText: async () => {
+            called++;
+            return { result: "should not happen" };
+          },
+        },
+      }),
+      {
+        events: finished.events,
+      },
+    );
+    expect(replayed.status).toBe("done");
+    expect(called).toBe(0);
+  });
+});
+
+describe("runAgent write-ahead store", () => {
+  const answer = createTextLogic({ model: "test-model", prompt: () => "hello" });
+
+  /** asking --(model)--> waiting --APPROVE--> done */
+  const makeMachine = () =>
+    setup({ actors: { answer } }).createMachine({
+      id: "stored",
+      context: () => ({}),
+      initial: "asking",
+      states: {
+        asking: {
+          invoke: { id: "ask", src: "answer", onDone: { target: "waiting" } },
+        },
+        waiting: { on: { APPROVE: { target: "done" } } },
+        done: { type: "final" },
+      },
+    });
+
+  const executors = () => ({ generateText: async () => ({ result: "42" }) });
+
+  test("a fresh run writes every entry to the store, in index order", async () => {
+    const store = createInMemoryEventLogStore();
+    const result = await runToQuiescence(
+      createAgentRuntime(makeMachine(), {
+        store,
+        threadId: "main",
+        executors: executors(),
+      }),
+      {
+        input: undefined,
+      },
+    );
+
+    expect(result.status).toBe("idle");
+    const stored = await store.read("main");
+    expect(stored).toEqual(result.events);
+    expect(stored.map((entry) => entry.index)).toEqual(stored.map((_entry, index) => index));
+    expect(stored[0]!.event.type).toBe(AGENT_INIT_EVENT_TYPE);
+  });
+
+  test("an observer that throws is reported and does not change the run", async () => {
+    const report = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const result = await runToQuiescence(
+        createAgentRuntime(makeMachine(), {
+          executors: executors(),
+          onTrace: () => {
+            throw new Error("sink down");
+          },
+          onTransition: () => {
+            throw new Error("sink down");
+          },
+        }),
+        { input: undefined },
+      );
+
+      expect(result.status).toBe("idle");
+      expect(report).toHaveBeenCalled();
+      expect(String(report.mock.calls[0]![0])).toContain("onTrace");
+    } finally {
+      report.mockRestore();
+    }
+  });
+
+  test("a thread started with other input is refused, and the same input resumes it", async () => {
+    const promptMachine = setup({}).createMachine({
+      id: "prompted",
+      context: ({ input }: { input: { prompt: string } }) => ({ prompt: input.prompt }),
+      initial: "waiting",
+      states: { waiting: { on: { GO: { target: "done" } } }, done: { type: "final" } },
+    });
+    const store = createInMemoryEventLogStore();
+    const first = await runToQuiescence(
+      createAgentRuntime(promptMachine, { store, threadId: "t1" }),
+      { input: { prompt: "a checkout flow" } },
+    );
+    expect(first.status).toBe("idle");
+
+    await expect(
+      runToQuiescence(createAgentRuntime(promptMachine, { store, threadId: "t1" }), {
+        input: { prompt: "a login flow" },
+      }),
+    ).rejects.toMatchObject({ code: "thread-input-mismatch" });
+
+    // The thread's own entries passed as `events` are checked the same way.
+    await expect(
+      runToQuiescence(createAgentRuntime(promptMachine, { store, threadId: "t1" }), {
+        events: first.events,
+        input: { prompt: "a login flow" },
+      }),
+    ).rejects.toMatchObject({ code: "thread-input-mismatch" });
+
+    const resumed = await runToQuiescence(
+      createAgentRuntime(promptMachine, { store, threadId: "t1" }),
+      { input: { prompt: "a checkout flow" }, event: { type: "GO" } as never },
+    );
+    expect(resumed.status).toBe("done");
+  });
+
+  test("a thread that began from a snapshot resumes with input", async () => {
+    const promptMachine = setup({}).createMachine({
+      id: "prompted",
+      context: ({ input }: { input: { prompt: string } }) => ({ prompt: input.prompt }),
+      initial: "waiting",
+      states: { waiting: { on: { GO: { target: "done" } } }, done: { type: "final" } },
+    });
+    const first = await runToQuiescence(createAgentRuntime(promptMachine), {
+      input: { prompt: "a checkout flow" },
+    });
+    if (first.status !== "idle") throw new Error("expected idle");
+
+    const store = createInMemoryEventLogStore();
+    await runToQuiescence(createAgentRuntime(promptMachine, { store, threadId: "s1" }), {
+      snapshot: first.persist(),
+    });
+    const resumed = await runToQuiescence(
+      createAgentRuntime(promptMachine, { store, threadId: "s1" }),
+      { input: { prompt: "a checkout flow" }, event: { type: "GO" } as never },
+    );
+    expect(resumed.status).toBe("done");
+  });
+
+  describe("values JSON cannot hold", () => {
+    const noteMachine = setup({}).createMachine({
+      id: "noted",
+      context: ({ input }: { input: { note?: string; at?: unknown } }) => ({ note: input.note }),
+      initial: "waiting",
+      states: { waiting: { on: { GO: { target: "done" } } }, done: { type: "final" } },
+    });
+
+    test("undefined fields are dropped from input and events, as JSON.stringify drops them", async () => {
+      const store = createInMemoryEventLogStore();
+      const first = await runToQuiescence(
+        createAgentRuntime(noteMachine, { store, threadId: "u" }),
+        { input: { note: undefined } },
+      );
+      const done = await runToQuiescence(
+        createAgentRuntime(noteMachine, { store, threadId: "u" }),
+        {
+          event: { type: "GO", detail: undefined } as never,
+        },
+      );
+
+      expect(first.status).toBe("idle");
+      expect(done.status).toBe("done");
+      const entries = await store.read("u");
+      expect(entries[0]!.event).not.toHaveProperty("input.note");
+      expect(entries.at(-1)!.event).toEqual({ type: "GO" });
+      expect(replay(noteMachine, entries).snapshot.status).toBe("done");
+    });
+
+    test("without a store, a non-JSON value warns and stops the log instead of failing the run", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      try {
+        const idle = await runToQuiescence(createAgentRuntime(noteMachine, {}), {
+          input: { note: "x" },
+        });
+        const done = await runToQuiescence(createAgentRuntime(noteMachine, {}), {
+          events: idle.events,
+          snapshot: idle.persist(),
+          event: { type: "GO", at: new Date(0) } as never,
+        });
+
+        expect(done.status).toBe("done");
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(String(warn.mock.calls[0]![0])).toMatch(/log stopped/);
+      } finally {
+        warn.mockRestore();
+      }
+    });
+
+    test("with a store, a non-JSON event fails the run", async () => {
+      const store = createInMemoryEventLogStore();
+      await runToQuiescence(createAgentRuntime(noteMachine, { store, threadId: "d" }), {
+        input: { note: "x" },
+      });
+      const result = await runToQuiescence(
+        createAgentRuntime(noteMachine, { store, threadId: "d" }),
+        {
+          event: { type: "GO", at: new Date(0) } as never,
+        },
+      );
+
+      expect(result.status).toBe("error");
+      expect(result.status === "error" && result.cause).toBe("journal");
+      // The refused event never moved the run: it still rests where the log ends.
+      expect(result.snapshot.value).toBe("waiting");
+      expect((result.persist() as { value?: unknown }).value).toBe("waiting");
+    });
+  });
+
+  test("a throwing `onEvent` is reported, and the log keeps one init entry", async () => {
+    const report = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      const store = createInMemoryEventLogStore();
+      const result = await runToQuiescence(
+        createAgentRuntime(makeMachine(), {
+          store,
+          threadId: "main",
+          executors: executors(),
+          onEvent: () => {
+            throw new Error("sink down");
+          },
+        }),
+        { input: undefined },
+      );
+
+      expect(result.status).not.toBe("error");
+      const stored = await store.read("main");
+      expect(stored.filter((entry) => entry.event.type === AGENT_INIT_EVENT_TYPE)).toHaveLength(1);
+      expect(String(report.mock.calls[0]![0])).toContain("onEvent");
+    } finally {
+      report.mockRestore();
+    }
+  });
+
+  test("a run whose init entry cannot be built fails instead of running unlogged", async () => {
+    const store = createInMemoryEventLogStore();
+    const result = await runToQuiescence(
+      createAgentRuntime(makeMachine(), { store, threadId: "main", executors: executors() }),
+      { input: { at: new Date(0) } as never },
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.status === "error" && result.cause).toBe("journal");
+    expect(await store.read("main")).toEqual([]);
+  });
+
+  test("the result resolves only after the last write lands", async () => {
+    const inner = createInMemoryEventLogStore();
+    let inFlight = 0;
+    const store: AgentEventLogStore = {
+      ...inner,
+      append: async (input) => {
+        inFlight++;
+        await new Promise((resolve) => setTimeout(resolve, 1));
+        await inner.append(input);
+        inFlight--;
+      },
+    };
+
+    const result = await runToQuiescence(
+      createAgentRuntime(makeMachine(), {
+        store,
+        threadId: "main",
+        executors: executors(),
+      }),
+      {
+        input: undefined,
+      },
+    );
+
+    expect(inFlight).toBe(0);
+    expect(await store.read("main")).toEqual(result.events);
+  });
+
+  test("no model call is made until the preceding entry is durable", async () => {
+    const inner = createInMemoryEventLogStore();
+    const gates: Array<() => void> = [];
+    let holding = true;
+    const store: AgentEventLogStore = {
+      ...inner,
+      append: async (input) => {
+        if (holding) {
+          await new Promise<void>((resolve) => gates.push(resolve));
+        }
+        await inner.append(input);
+      },
+    };
+
+    let calls = 0;
+    const settled = runToQuiescence(
+      createAgentRuntime(makeMachine(), {
+        store,
+        threadId: "main",
+        executors: {
+          generateText: async () => {
+            calls++;
+            return { result: "42" };
+          },
+        },
+      }),
+      {
+        input: undefined,
+      },
+    );
+
+    // Several turns of the loop: the run is blocked on the init entry's write.
+    for (let i = 0; i < 10; i++) {
+      await Promise.resolve();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls).toBe(0);
+
+    holding = false;
+    for (const release of gates.splice(0)) {
+      release();
+    }
+    const result = await settled;
+    expect(calls).toBe(1);
+    expect(result.status).toBe("idle");
+  });
+
+  test("resuming from the store alone continues the log without re-executing", async () => {
+    const twoCallMachine = setup({ actors: { answer } }).createMachine({
+      id: "two-calls",
+      context: () => ({}),
+      initial: "a",
+      states: {
+        a: { invoke: { id: "a", src: "answer", onDone: { target: "b" } } },
+        b: { invoke: { id: "b", src: "answer", onDone: { target: "waiting" } } },
+        waiting: { on: { GO: { target: "done" } } },
+        done: { type: "final" },
+      },
+    });
+
+    const store = createInMemoryEventLogStore();
+    const firstCalls: Array<{ requestId?: string; callKey?: string }> = [];
+    const controller = new AbortController();
+    const inFlight = deferred();
+    const running = runToQuiescence(
+      createAgentRuntime(twoCallMachine, {
+        store,
+        threadId: "main",
+        signal: controller.signal,
+        executors: {
+          generateText: async (_request, info) => {
+            firstCalls.push({ requestId: info?.requestId, callKey: info?.callKey });
+            if (firstCalls.length === 1) return { result: "one" };
+            inFlight.resolve();
+            return await new Promise<never>(() => {});
+          },
+        },
+      }),
+      {
+        input: undefined,
+      },
+    );
+    await inFlight.promise;
+    controller.abort();
+    const crashed = await running;
+    expect(crashed.status).toBe("error");
+
+    const secondCalls: Array<{ requestId?: string; callKey?: string }> = [];
+    // No `events`, no snapshot: the thread's log in the store IS the resume.
+    const recovered = await runToQuiescence(
+      createAgentRuntime(twoCallMachine, {
+        store,
+        threadId: "main",
+        executors: {
+          generateText: async (_request, info) => {
+            secondCalls.push({ requestId: info?.requestId, callKey: info?.callKey });
+            return { result: "two" };
+          },
+        },
+      }),
+    );
+
+    expect(recovered.status).toBe("idle");
+    expect(secondCalls.map((call) => call.requestId)).toEqual(["b"]);
+    expect(secondCalls[0]!.callKey).toBe(firstCalls[1]!.callKey);
+    expect(recovered.events.slice(0, crashed.events.length)).toEqual(crashed.events);
+    expect(await store.read("main")).toEqual(recovered.events);
+  });
+
+  test("a conflicting writer stops the run with cause 'journal'", async () => {
+    const inner = createInMemoryEventLogStore();
+    let stolen = false;
+    const store: AgentEventLogStore = {
+      ...inner,
+      append: async (input) => {
+        if (!stolen) {
+          // A concurrent writer takes this index first.
+          stolen = true;
+          await inner.append({
+            ...input,
+            entries: input.entries.map((entry) => ({ ...entry, id: `${entry.id}_other` })),
+          });
+        }
+        await inner.append(input);
+      },
+    };
+
+    let calls = 0;
+    const result = await runToQuiescence(
+      createAgentRuntime(makeMachine(), {
+        store,
+        threadId: "main",
+        executors: {
+          generateText: async () => {
+            calls++;
+            return { result: "42" };
+          },
+        },
+      }),
+      {
+        input: undefined,
+      },
+    );
+
+    expect(result.status).toBe("error");
+    expect(result.status === "error" && result.cause).toBe("journal");
+    expect(result.status === "error" && result.error).toBeInstanceOf(AgentEventLogConflictError);
+    // The barrier held the model call back until the write failed.
+    expect(calls).toBe(0);
+  });
+
+  test("`store` without `threadId` throws, and `events` must match the thread's length", async () => {
+    const store = createInMemoryEventLogStore();
+    expect(() =>
+      createAgentRuntime(makeMachine(), {
+        store,
+        executors: executors(),
+      }),
+    ).toThrow(expect.objectContaining({ code: "missing-thread-id" }));
+
+    const first = await runToQuiescence(
+      createAgentRuntime(makeMachine(), {
+        store,
+        threadId: "main",
+        executors: executors(),
+      }),
+      {
+        input: undefined,
+      },
+    );
+    await expect(
+      runToQuiescence(
+        createAgentRuntime(makeMachine(), {
+          store,
+          threadId: "main",
+          executors: executors(),
+        }),
+        {
+          events: first.events.slice(0, 1),
+        },
+      ),
+    ).rejects.toBeInstanceOf(AgentEventLogConflictError);
+  });
+
+  test("`events` of the right length but the wrong content are rejected", async () => {
+    const store = createInMemoryEventLogStore();
+    const first = await runToQuiescence(
+      createAgentRuntime(makeMachine(), {
+        store,
+        threadId: "main",
+        executors: executors(),
+      }),
+      {
+        input: undefined,
+      },
+    );
+
+    // Same length, one entry from somewhere else: appending onto this thread
+    // would splice two lineages together.
+    const altered = JSON.parse(JSON.stringify(first.events)) as AgentLogEntry[];
+    altered[1] = { ...altered[1]!, id: `${altered[1]!.id}_other` };
+    await expect(
+      runToQuiescence(
+        createAgentRuntime(makeMachine(), {
+          store,
+          threadId: "main",
+          executors: executors(),
+        }),
+        {
+          events: altered,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "event-log-conflict" });
+
+    // The thread's own log still resumes.
+    const resumed = await runToQuiescence(
+      createAgentRuntime(makeMachine(), {
+        store,
+        threadId: "main",
+        executors: executors(),
+      }),
+      {
+        events: first.events,
+        snapshot: first.persist(),
+        event: { type: "APPROVE" } as never,
+      },
+    );
+    expect(resumed.status).toBe("done");
+  });
+
+  test("`events` whose payload keys are merely reordered still match the thread", async () => {
+    const store = createInMemoryEventLogStore();
+    const first = await runToQuiescence(
+      createAgentRuntime(makeMachine(), {
+        store,
+        threadId: "main",
+        executors: executors(),
+      }),
+      {
+        input: undefined,
+      },
+    );
+
+    // Same content, different key insertion order: a host that rebuilt the
+    // entries from a database row must not be told its own log diverged.
+    const reordered = (JSON.parse(JSON.stringify(first.events)) as AgentLogEntry[]).map(
+      (entry) => ({
+        ...entry,
+        event: Object.fromEntries(Object.entries(entry.event).reverse()) as AgentLogEntry["event"],
+      }),
+    );
+    const resumed = await runToQuiescence(
+      createAgentRuntime(makeMachine(), {
+        store,
+        threadId: "main",
+        executors: executors(),
+      }),
+      {
+        events: reordered,
+        snapshot: first.persist(),
+        event: { type: "APPROVE" } as never,
+      },
+    );
+    expect(resumed.status).toBe("done");
+  });
+
+  test("result.drain() waits for a straggler's write; the result itself does not", async () => {
+    const inner = createInMemoryEventLogStore();
+    const slowStore: AgentEventLogStore = {
+      ...inner,
+      append: async (input) => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        await inner.append(input);
+      },
+    };
+
+    const controller = new AbortController();
+    const inFlight = deferred();
+    const release = deferred();
+    const stragglerAppended = deferred();
+    let atSettle: number | undefined;
+    let streamed = 0;
+
+    const running = runToQuiescence(
+      createAgentRuntime(makeMachine(), {
+        store: slowStore,
+        threadId: "main",
+        signal: controller.signal,
+        onEvent: () => {
+          streamed++;
+          if (atSettle !== undefined && streamed > atSettle) {
+            stragglerAppended.resolve();
+          }
+        },
+        executors: {
+          generateText: async () => {
+            inFlight.resolve();
+            await release.promise;
+            return { result: "42", usage: { totalTokens: 5 } };
+          },
+        },
+      }),
+      {
+        input: undefined,
+      },
+    );
+    await inFlight.promise;
+    controller.abort();
+    const result = await running;
+    expect(result.status).toBe("error");
+
+    atSettle = streamed;
+    expect(await inner.read("main")).toHaveLength(atSettle);
+
+    // The straggler's usage entry is appended after the run returned, so its
+    // write is outside the result's own barrier...
+    release.resolve();
+    await stragglerAppended.promise;
+    expect(await inner.read("main")).toHaveLength(atSettle);
+
+    // ...and `drain()` is what waits for it.
+    await result.drain();
+    const stored = await inner.read("main");
+    expect(stored).toHaveLength(atSettle + 1);
+    expect(stored[stored.length - 1]!.event.type).toBe(AGENT_USAGE_EVENT_TYPE);
+  });
+});
+
+describe("parallel invokes: recorded hashes are what replay reproduces", () => {
+  // `second` settles right after `first`, before the root has taken
+  // `first`'s completion from the mailbox. The live snapshot at that entry
+  // holds `second` already `done`; replay never starts children, so it holds
+  // `second` active. The recorded hash must be replay's.
+  const makeMachine = () => {
+    const firstSettled = deferred();
+    return setupAgent({
+      context: z.object({ order: z.array(z.string()) }),
+      actors: {
+        first: createAsyncLogic({
+          run: async () => {
+            firstSettled.resolve();
+            return "first";
+          },
+        }),
+        second: createAsyncLogic({
+          run: async () => {
+            await firstSettled.promise;
+            return "second";
+          },
+        }),
+      },
+    }).createMachine({
+      id: "parallelInvokes",
+      context: { order: [] },
+      initial: "verifying",
+      states: {
+        verifying: {
+          type: "parallel",
+          // Declared opposite to settle order.
+          states: {
+            b: {
+              initial: "running",
+              states: {
+                running: {
+                  invoke: {
+                    id: "second",
+                    src: "second",
+                    onDone: ({ context, event }) => ({
+                      target: "done",
+                      context: { order: [...context.order, event.output as string] },
+                    }),
+                  },
+                },
+                done: { type: "final" },
+              },
+            },
+            a: {
+              initial: "running",
+              states: {
+                running: {
+                  invoke: {
+                    id: "first",
+                    src: "first",
+                    onDone: ({ context, event }) => ({
+                      target: "done",
+                      context: { order: [...context.order, event.output as string] },
+                    }),
+                  },
+                },
+                done: { type: "final" },
+              },
+            },
+          },
+          onDone: { target: "waiting" },
+        },
+        waiting: { on: { GO: { target: "finished" } } },
+        finished: { type: "final" },
+      },
+    });
+  };
+  const executors = { generateText: async () => ({ result: "" }) };
+
+  test("resuming an idle run from the store alone replays and verifies", async () => {
+    const machine = makeMachine();
+    const store = createInMemoryEventLogStore();
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, { store, threadId: "t", executors }),
+      { input: undefined },
+    );
+    expect(first.status).toBe("idle");
+    expect(first.snapshot.context.order).toEqual(["first", "second"]);
+
+    const log = await store.read("t");
+    // Journaled in delivery order, not declaration order.
+    expect(
+      log
+        .filter((entry) => entry.event.type === "xstate.done.actor")
+        .map((entry) => (entry.event as { actorId?: string }).actorId),
+    ).toEqual(["first", "second"]);
+    expect(() => replay(machine, log, { verify: "strict" })).not.toThrow();
+
+    const second = await runToQuiescence(
+      createAgentRuntime(machine, { store, threadId: "t", executors }),
+      { event: { type: "GO" } },
+    );
+    expect(second.status).toBe("done");
+    const resumedLog = await store.read("t");
+    expect(() => replay(machine, resumedLog, { verify: "strict" })).not.toThrow();
+  });
+
+  test("a snapshot cache taken at idle is still trusted against the log", async () => {
+    const machine = makeMachine();
+    const store = createInMemoryEventLogStore();
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, { store, threadId: "t", executors }),
+      { input: undefined },
+    );
+    const second = await runToQuiescence(
+      createAgentRuntime(machine, { store, threadId: "t", executors }),
+      { snapshot: first.persist(), event: { type: "GO" } },
+    );
+    expect(second.status).toBe("done");
+  });
+});
+
+describe("wire events: parse at the boundary, ignore what the state does not handle", () => {
+  const agent = setupAgent({
+    context: z.object({ reason: z.string() }),
+    input: z.object({}),
+    output: z.object({}),
+    events: {
+      APPROVE: z.object({}),
+      REJECT: z.object({ reason: z.string() }),
+    },
+  });
+  const machine = agent.createMachine({
+    context: { reason: "" },
+    initial: "reviewing",
+    states: {
+      reviewing: {
+        on: {
+          APPROVE: { target: "done" },
+          REJECT: ({ event }) => ({ target: "done", context: { reason: event.reason } }),
+        },
+      },
+      done: { type: "final", output: () => ({}) },
+    },
+  });
+  const executors = { generateText: async () => ({ result: {} }) };
+
+  const paused = async () => {
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors,
+      }),
+      {
+        input: {},
+      },
+    );
+    if (first.status !== "idle") throw new Error("expected idle");
+    return first;
+  };
+
+  test("a well-formed wire event parses from the machine and resumes the run", async () => {
+    const first = await paused();
+    const event = parseAgentEvent(machine, JSON.parse('{"type":"REJECT","reason":"too terse"}'));
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors,
+      }),
+      {
+        snapshot: first.persist(),
+        event,
+      },
+    );
+    expect(result.status).toBe("done");
+    expect(result.snapshot.context.reason).toBe("too terse");
+  });
+
+  test("a bad payload throws AgentInvalidEventPayloadError at the boundary", () => {
+    expect(() => parseAgentEvent(machine, { type: "REJECT", reason: 42 })).toThrow(
+      AgentInvalidEventPayloadError,
+    );
+    expect(() => parseAgentEvent(machine, "APPROVE")).toThrow(AgentInvalidEventPayloadError);
+    expect(() => parseAgentEvent(machine, null)).toThrow(AgentInvalidEventPayloadError);
+  });
+
+  test("an event with no declared schema parses, and an unhandled one settles ignored", async () => {
+    const first = await paused();
+    const event = parseAgentEvent(machine, { type: "NOPE" });
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors,
+      }),
+      {
+        snapshot: first.persist(),
+        event,
+      },
+    );
+    expect(result.status).toBe("idle");
+    expect(result.ignored).toEqual({ type: "NOPE" });
+    expect(result.snapshot.value).toBe("reviewing");
+  });
+
+  test("schemas resolve through a run result snapshot, whose machine is `.provide`-rebound", async () => {
+    const first = await paused();
+    // `runAgent` starts the actor from `machine.provide(...)`, so
+    // `snapshot.machine` is NOT the object `setupAgent` registered. The schema
+    // registry falls back to the shared root `config`, so validation still runs.
+    expect(() => parseAgentEvent(first.snapshot, { type: "REJECT", reason: 7 })).toThrow(
+      AgentInvalidEventPayloadError,
+    );
+    expect(parseAgentEvent(first.snapshot, { type: "REJECT", reason: "ok" })).toEqual({
+      type: "REJECT",
+      reason: "ok",
+    });
+  });
+
+  test("an ignored event leaves the thread resumable", async () => {
+    const store = createInMemoryEventLogStore();
+    const threadId = "t1";
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors,
+        store,
+        threadId,
+      }),
+      {
+        input: {},
+      },
+    );
+    if (first.status !== "idle") throw new Error("expected idle");
+
+    const ignoredRun = await runToQuiescence(
+      createAgentRuntime(machine, {
+        store,
+        threadId,
+        executors,
+      }),
+      {
+        event: parseAgentEvent(machine, { type: "NOPE" }),
+      },
+    );
+    expect(ignoredRun.status).toBe("idle");
+    expect(ignoredRun.ignored).toEqual({ type: "NOPE" });
+
+    const ok = await runToQuiescence(
+      createAgentRuntime(machine, {
+        store,
+        threadId,
+        executors,
+      }),
+      {
+        event: parseAgentEvent(machine, { type: "APPROVE" }),
+      },
+    );
+    expect(ok.status).toBe("done");
+  });
+});
+
+// Pins the XState behaviour `runAgent` reads to set `result.ignored` (see
+// run-agent.ts, where the resume event is delivered). If an xstate bump breaks
+// any assertion here, `result.ignored` is wrong — fix the detection, not this
+// test.
+describe("result.ignored reads the transition facets, not snapshot identity", () => {
+  test("an effect-only resume event is handled, not ignored", async () => {
+    const effects: string[] = [];
+    const machine = setup({}).createMachine({
+      initial: "waiting",
+      states: {
+        waiting: {
+          on: {
+            // Effect-only: enqueues work and selects no transition.
+            PING: (_args, enqueue) => {
+              enqueue(() => effects.push("noted"));
+              return undefined;
+            },
+            GO: { target: "done" },
+          },
+        },
+        done: { type: "final" },
+      },
+    });
+    const first = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {},
+      }),
+      {
+        input: undefined,
+      },
+    );
+    expect(first.status).toBe("idle");
+    const pinged = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {},
+      }),
+      {
+        snapshot: first.persist(),
+        event: { type: "PING" } as never,
+      },
+    );
+    expect(effects).toEqual(["noted"]);
+    expect(pinged.ignored).toBeUndefined();
+    const unknown = await runToQuiescence(
+      createAgentRuntime(machine, {
+        executors: {},
+      }),
+      {
+        snapshot: first.persist(),
+        event: { type: "NOPE" } as never,
+      },
+    );
+    expect(unknown.ignored).toEqual({ type: "NOPE" });
+  });
+});
+
+describe("xstate contract: snapshot identity is NOT a usable `ignored` signal", () => {
+  const effects: string[] = [];
+  const build = () =>
+    setup({}).createMachine({
+      id: "ignored-signal",
+      context: { n: 0 },
+      initial: "a",
+      states: {
+        a: {
+          on: {
+            // Observably different: a new snapshot object.
+            BUMP: ({ context }) => ({ context: { n: context.n + 1 } }),
+            // Runs an effect but selects no transition and changes nothing.
+            EFFECT: (_args, enqueue) => {
+              enqueue(() => effects.push("ran"));
+              return undefined;
+            },
+            // A guard-style refusal.
+            MAYBE: () => undefined,
+          },
+        },
+      },
+    });
+
+  test("an unhandled event returns the SAME snapshot object", () => {
+    const actor = createActor(build()).start();
+    const before = actor.getSnapshot();
+    actor.send({ type: "NOPE" } as never);
+    expect(Object.is(before, actor.getSnapshot())).toBe(true);
+  });
+
+  test("a transition that updates context returns a NEW snapshot object", () => {
+    const actor = createActor(build()).start();
+    const before = actor.getSnapshot();
+    actor.send({ type: "BUMP" } as never);
+    expect(Object.is(before, actor.getSnapshot())).toBe(false);
+  });
+
+  test("a transition function returning undefined returns the SAME snapshot object", () => {
+    const actor = createActor(build()).start();
+    const before = actor.getSnapshot();
+    actor.send({ type: "MAYBE" } as never);
+    expect(Object.is(before, actor.getSnapshot())).toBe(true);
+  });
+
+  // Since xstate 6.0.0-alpha.61 a handled event always yields a new snapshot
+  // object, even when the transition only runs an effect. The runtime's
+  // `ignored` rule (same snapshot AND no effects) therefore does not report
+  // this event as ignored.
+  test("an effect-only transition returns a NEW snapshot object", () => {
+    const actor = createActor(build()).start();
+    const before = actor.getSnapshot();
+    effects.length = 0;
+    actor.send({ type: "EFFECT" } as never);
+    expect(effects.length).toBeGreaterThan(0);
+    expect(Object.is(before, actor.getSnapshot())).toBe(false);
+  });
+});
+
+describe("runAgent (sugar over createAgentRuntime + runToQuiescence)", () => {
+  function createReviewMachine() {
+    const schemas = createAgentSchemas({
+      context: z.object({ topic: z.string(), draft: z.string().nullable(), drafts: z.number() }),
+      input: z.object({ topic: z.string() }),
+      output: z.object({ draft: z.string(), drafts: z.number() }),
+      // NUDGE is declared but no state handles it: an answer the idle state ignores.
+      events: { APPROVE: z.object({}), REJECT: z.object({}), NUDGE: z.object({}) },
+    });
+    const draftText = createTextLogic({
+      schemas: { input: z.object({ topic: z.string() }), output: z.string() },
+      model: "test-model",
+      prompt: ({ input }) => input.topic,
+    });
+    const agent = setupAgent({ schemas, actors: { draftText } });
+    return agent.createMachine({
+      context: ({ input }) => ({ topic: input.topic, draft: null, drafts: 0 }),
+      initial: "drafting",
+      states: {
+        drafting: {
+          invoke: {
+            id: "draft",
+            src: "draftText",
+            input: ({ context }) => ({ topic: context.topic }),
+            onDone: ({ context, output }) => ({
+              target: "awaitingApproval",
+              context: { draft: output.result, drafts: context.drafts + 1 },
+            }),
+          },
+        },
+        awaitingApproval: {
+          on: { APPROVE: { target: "done" }, REJECT: { target: "drafting" } },
+        },
+        done: {
+          type: "final",
+          output: ({ context }) => ({ draft: context.draft ?? "", drafts: context.drafts }),
+        },
+      },
+    });
+  }
+
+  function createExecutors() {
+    let calls = 0;
+    return {
+      generateText: async (request: AgentTextRequest & { tools: AgentTools }) => {
+        calls += 1;
+        return { result: `Draft ${calls} about ${request.prompt}` };
+      },
+    };
+  }
+
+  function createDoneMachine() {
+    const schemas = createAgentSchemas({
+      context: z.object({ prompt: z.string(), answer: z.string().nullable() }),
+      input: z.object({ prompt: z.string() }),
+      output: z.object({ answer: z.string() }),
+    });
+    const answerQuestion = createTextLogic({
+      schemas: {
+        input: z.object({ prompt: z.string() }),
+        output: z.object({ answer: z.string() }),
+      },
+      model: "test-model",
+      prompt: ({ input }) => input.prompt,
+    });
+    const agent = setupAgent({ schemas, actors: { answerQuestion } });
+    return agent.createMachine({
+      context: ({ input }) => ({ prompt: input.prompt, answer: null }),
+      initial: "answering",
+      states: {
+        answering: {
+          invoke: {
+            id: "answer",
+            src: "answerQuestion",
+            input: ({ context }) => ({ prompt: context.prompt }),
+            onDone: ({ output }) => ({ target: "done", context: { answer: output.result.answer } }),
+          },
+        },
+        done: { type: "final", output: ({ context }) => ({ answer: context.answer ?? "" }) },
+      },
+    });
+  }
+
+  const answerExecutors = {
+    generateText: async (request: AgentTextRequest & { tools: AgentTools }) => ({
+      result: { answer: `Answered: ${request.prompt}` },
+    }),
+  };
+
+  test("happy path: one call runs to done with the typed output", async () => {
+    const result = await runAgent(createDoneMachine(), {
+      input: { prompt: "why state machines?" },
+      executors: answerExecutors,
+    });
+    expect(result.status).toBe("done");
+    expect(result.status === "done" ? result.output : undefined).toEqual({
+      answer: "Answered: why state machines?",
+    });
+  });
+
+  test("resume: a run left idle finishes from { snapshot, event }", async () => {
+    const machine = createReviewMachine();
+    const executors = createExecutors();
+    const first = await runAgent(machine, { input: { topic: "release notes" }, executors });
+    expect(first.status).toBe("idle");
+    expect(first.snapshot.value).toBe("awaitingApproval");
+
+    const second = await runAgent(machine, {
+      executors,
+      snapshot: first.persist(),
+      event: { type: "APPROVE" },
+    });
+    expect(second.status).toBe("done");
+    expect(second.status === "done" ? second.output : undefined).toEqual({
+      draft: "Draft 1 about release notes",
+      drafts: 1,
+    });
+  });
+
+  test("onIdle: answers each idle in place until done", async () => {
+    const answers: Array<{ type: "APPROVE" } | { type: "REJECT" }> = [
+      { type: "REJECT" },
+      { type: "APPROVE" },
+    ];
+    const seen: Array<{ value: unknown; idle: boolean; drafts: number }> = [];
+    const result = await runAgent(createReviewMachine(), {
+      input: { topic: "incident recap" },
+      executors: createExecutors(),
+      onIdle: async (snapshot) => {
+        seen.push({
+          value: snapshot.value,
+          idle: isAgentIdle(snapshot),
+          drafts: snapshot.context.drafts,
+        });
+        return answers.shift()!;
+      },
+    });
+
+    expect(seen).toEqual([
+      { value: "awaitingApproval", idle: true, drafts: 1 },
+      { value: "awaitingApproval", idle: true, drafts: 2 },
+    ]);
+    expect(answers).toHaveLength(0);
+    expect(result.status).toBe("done");
+    expect(result.status === "done" ? result.output : undefined).toEqual({
+      draft: "Draft 2 about incident recap",
+      drafts: 2,
+    });
+  });
+
+  test("equivalence: matches runToQuiescence(createAgentRuntime(...))", async () => {
+    type Run = Awaited<ReturnType<typeof runAgent>>;
+    const expectSameRun = (viaSugar: Run, viaRuntime: Run) => {
+      expect(viaSugar.status).toBe(viaRuntime.status);
+      expect(viaSugar.status === "done" ? viaSugar.output : undefined).toEqual(
+        viaRuntime.status === "done" ? viaRuntime.output : undefined,
+      );
+      expect(viaSugar.snapshot.value).toEqual(viaRuntime.snapshot.value);
+      expect(viaSugar.snapshot.context).toEqual(viaRuntime.snapshot.context);
+      expect(viaSugar.events.map((entry) => entry.event.type)).toEqual(
+        viaRuntime.events.map((entry) => entry.event.type),
+      );
+    };
+
+    const done = createDoneMachine();
+    const doneInput = { prompt: "same?" };
+    expectSameRun(
+      await runAgent(done, { input: doneInput, executors: answerExecutors }),
+      await runToQuiescence(createAgentRuntime(done, { executors: answerExecutors }), {
+        input: doneInput,
+      }),
+    );
+
+    const review = createReviewMachine();
+    const reviewInput = { topic: "same?" };
+    expectSameRun(
+      await runAgent(review, { input: reviewInput, executors: createExecutors() }),
+      await runToQuiescence(createAgentRuntime(review, { executors: createExecutors() }), {
+        input: reviewInput,
+      }),
+    );
+  });
+
+  test("onIdle: an ignored answer stops the loop and is reported", async () => {
+    let calls = 0;
+    const result = await runAgent(createReviewMachine(), {
+      input: { topic: "nudged" },
+      executors: createExecutors(),
+      onIdle: async () => {
+        calls += 1;
+        return { type: "NUDGE" } as const;
+      },
+    });
+    expect(calls).toBe(1);
+    expect(result.status).toBe("idle");
+    expect(result.ignored).toEqual({ type: "NUDGE" });
+    expect(result.snapshot.value).toBe("awaitingApproval");
+  });
+
+  test("onIdle: an ignored opening event is returned before any answer", async () => {
+    const machine = createReviewMachine();
+    const executors = createExecutors();
+    const first = await runAgent(machine, { input: { topic: "opening" }, executors });
+    let calls = 0;
+    const result = await runAgent(machine, {
+      executors,
+      snapshot: first.persist(),
+      event: { type: "NUDGE" },
+      onIdle: async () => {
+        calls += 1;
+        return { type: "APPROVE" } as const;
+      },
+    });
+    expect(calls).toBe(0);
+    expect(result.ignored).toEqual({ type: "NUDGE" });
+  });
+
+  test("onIdle: maxModelCalls bounds the whole call, not each pass", async () => {
+    let calls = 0;
+    const result = await runAgent(createReviewMachine(), {
+      input: { topic: "budget" },
+      executors: createExecutors(),
+      maxModelCalls: 2,
+      onIdle: async () => {
+        calls += 1;
+        return { type: "REJECT" } as const;
+      },
+    });
+    // Draft 1 (pass 1), draft 2 (pass 2), draft 3 is over budget (pass 3).
+    expect(calls).toBe(2);
+    expect(result.status).toBe("error");
+    expect(result.status === "error" ? result.cause : undefined).toBe("max-model-calls");
+  });
+
+  test("onIdle: the final log replays every pass from the original input", async () => {
+    const answers: Array<{ type: "APPROVE" } | { type: "REJECT" }> = [
+      { type: "REJECT" },
+      { type: "APPROVE" },
+    ];
+    const result = await runAgent(createReviewMachine(), {
+      input: { topic: "history" },
+      executors: createExecutors(),
+      onIdle: async () => answers.shift()!,
+    });
+    expect(result.status).toBe("done");
+    const types = result.events.map((entry) => entry.event.type);
+    expect(types[0]).toBe("@agent.init");
+    expect(types.filter((type) => type === "@agent.init")).toHaveLength(1);
+    expect(types.filter((type) => type === "REJECT")).toHaveLength(1);
+    expect(types.filter((type) => type === "APPROVE")).toHaveLength(1);
+    expect(types.filter((type) => type === "xstate.done.actor")).toHaveLength(2);
+    // The log alone rebuilds the finished run.
+    const replayed = await runAgent(createReviewMachine(), {
+      events: result.events,
+      executors: createExecutors(),
+    });
+    expect(replayed.status).toBe("done");
+    expect(replayed.snapshot.context).toEqual(result.snapshot.context);
+  });
+
+  test("onIdle is not called when the first pass finishes done", async () => {
+    let calls = 0;
+    const result = await runAgent(createDoneMachine(), {
+      input: { prompt: "no wait" },
+      executors: answerExecutors,
+      onIdle: async () => {
+        calls += 1;
+        throw new Error("unreachable");
+      },
+    });
+    expect(result.status).toBe("done");
+    expect(calls).toBe(0);
+  });
+});
+
+describe("invoked async actor completing without a value", () => {
+  // XState's `createAsyncLogic` completes with `output: undefined` for a void
+  // `run` and `output: null` for one resolving `null`. The journal must accept
+  // both: it drops the explicit `undefined` and keeps `null`.
+  test.each([
+    ["undefined", async () => {}, false],
+    ["null", async () => null, true],
+  ])("journals the done event when run resolves %s", async (_label, run, hasOutput) => {
+    const machine = setupAgent({
+      context: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+    }).createMachine({
+      id: "voidOutput",
+      context: {},
+      initial: "working",
+      states: {
+        working: {
+          invoke: {
+            src: createAsyncLogic({ run }),
+            onDone: { target: "finished" },
+          },
+        },
+        finished: { type: "final", output: () => ({ ok: true }) },
+      },
+    });
+
+    const entries: AgentLogEntry[] = [];
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        onEvent: (entry) => entries.push(entry),
+        executors: { generateText: async () => ({ result: "" }) },
+      }),
+    );
+    expect(result.status).toBe("done");
+    const done = entries.find((entry) => entry.event.type === "xstate.done.actor");
+    expect(done).toBeDefined();
+    expect(Object.hasOwn(done!.event, "output")).toBe(hasOutput);
+    expect(() => JSON.parse(JSON.stringify(done))).not.toThrow();
+  });
+
+  test("replay sees the same own `output` key the live transition did", async () => {
+    const machine = setupAgent({
+      context: z.object({ hadKey: z.boolean() }),
+      output: z.object({ hadKey: z.boolean() }),
+      actors: { voidActor: createAsyncLogic({ run: async () => {} }) },
+    }).createMachine({
+      id: "voidOutputKey",
+      context: { hadKey: false },
+      initial: "working",
+      states: {
+        working: {
+          invoke: {
+            src: "voidActor",
+            onDone: ({ event }) => ({
+              target: "finished",
+              context: { hadKey: Object.hasOwn(event, "output") },
+            }),
+          },
+        },
+        finished: { type: "final", output: ({ context }) => ({ hadKey: context.hadKey }) },
+      },
+    });
+
+    const entries: AgentLogEntry[] = [];
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, {
+        onEvent: (entry) => entries.push(entry),
+        executors: { generateText: async () => ({ result: "" }) },
+      }),
+    );
+    expect(result.status === "done" ? result.output : undefined).toEqual({ hadKey: true });
+    // A JSON round-trip (what a store does) must replay to the same state.
+    const replayed = replay(machine, JSON.parse(JSON.stringify(entries)) as AgentLogEntry[]);
+    expect(replayed.snapshot.output).toEqual({ hadKey: true });
+  });
+});
+
+describe("host-owned timers across resumes", () => {
+  const waiting = setupAgent({
+    context: z.object({}),
+    events: { GO: z.object({}) },
+  }).createMachine({
+    context: {},
+    initial: "wait",
+    states: {
+      wait: { after: { 1000: { target: "late" } }, on: { GO: { target: "done" } } },
+      late: { on: { GO: { target: "done" } } },
+      done: { type: "final" },
+    },
+  });
+
+  test("an onIdle pass resumes a snapshot whose timer carries a wall-clock start", async () => {
+    const result = await runAgent(waiting, {
+      timers: { schedule: () => {}, cancel: () => {} },
+      store: createInMemoryEventLogStore(),
+      threadId: "t",
+      onIdle: async () => ({ type: "GO" as const }),
+    });
+    expect(result.status).toBe("done");
+  });
+});
+
+describe("onIdle passes", () => {
+  const counter = setupAgent({
+    context: z.object({ count: z.number() }),
+    events: { TICK: z.object({}), STOP: z.object({}) },
+  }).createMachine({
+    id: "counter",
+    context: { count: 0 },
+    initial: "waiting",
+    states: {
+      waiting: {
+        on: {
+          TICK: ({ context }) => ({ context: { count: context.count + 1 } }),
+          STOP: { target: "done" },
+        },
+      },
+      done: { type: "final" },
+    },
+  });
+
+  test("an inspector sees the root once across every pass", async () => {
+    const announced: Array<string | undefined> = [];
+    let answers = 0;
+    const result = await runAgent(counter, {
+      inspect: (event) => {
+        if (event.type === "@xstate.actor") announced.push(event.actorRef.sessionId);
+      },
+      onIdle: async () => (answers++ < 3 ? { type: "TICK" as const } : { type: "STOP" as const }),
+    });
+    expect(result.status).toBe("done");
+    expect(answers).toBe(4);
+    expect(announced).toHaveLength(1);
+  });
+
+  test("aborting the signal while onIdle waits settles the run", async () => {
+    const controller = new AbortController();
+    let seen: AbortSignal | undefined;
+    const pending = runAgent(counter, {
+      signal: controller.signal,
+      onIdle: (_snapshot, { signal }) => {
+        seen = signal;
+        return new Promise(() => {});
+      },
+    });
+    await vi.waitFor(() => expect(seen).toBe(controller.signal));
+    controller.abort(new Error("stop"));
+    const result = await pending;
+    expect(result).toMatchObject({ status: "error", cause: "aborted" });
+  });
+});
+
+describe("a request failing inside a child machine", () => {
+  test("reaches the child's onError", async () => {
+    const child = setupAgent({
+      context: z.object({}),
+      events: {},
+      output: z.object({ ok: z.boolean() }),
+      requests: {
+        ask: { model: "m", schemas: { input: z.object({}), output: z.string() }, prompt: "hi" },
+      },
+    }).createMachine({
+      context: {},
+      initial: "asking",
+      states: {
+        asking: {
+          invoke: {
+            src: "ask",
+            input: {},
+            onDone: { target: "ok" },
+            onError: { target: "failed" },
+          },
+        },
+        ok: { type: "final", output: () => ({ ok: true }) },
+        failed: { type: "final", output: () => ({ ok: false }) },
+      },
+    });
+    const parent = setupAgent({
+      context: z.object({ ok: z.boolean().nullable() }),
+      events: {},
+      actors: { child },
+    }).createMachine({
+      context: { ok: null },
+      initial: "running",
+      states: {
+        running: {
+          invoke: {
+            src: "child",
+            input: {},
+            onDone: ({ event }) => ({ target: "done", context: { ok: event.output.ok } }),
+          },
+        },
+        done: { type: "final" },
+      },
+    });
+    const result = await runAgent(parent, {
+      executors: {
+        generateText: async () => {
+          throw new Error("provider 500");
+        },
+      },
+    });
+    expect(result.status).toBe("done");
+    expect(result.snapshot.context.ok).toBe(false);
+  });
+});
+
+describe("usage from concurrent children", () => {
+  test("reaches the parent before the children's completions", async () => {
+    const child = setupAgent({
+      context: z.object({}),
+      events: {},
+      actors: { tool: createAsyncLogic({ run: async () => 1 }) },
+      requests: {
+        summarize: {
+          model: "m",
+          schemas: { input: z.object({}), output: z.string() },
+          prompt: "x",
+        },
+      },
+    }).createMachine({
+      context: {},
+      initial: "tool",
+      states: {
+        tool: { invoke: { src: "tool", onDone: { target: "work" } } },
+        work: { invoke: { src: "summarize", input: {}, onDone: { target: "done" } } },
+        done: { type: "final" },
+      },
+    });
+    const parent = setupAgent({
+      context: z.object({ tokens: z.number(), joined: z.number() }),
+      events: {},
+      actors: { child },
+    }).createMachine({
+      context: { tokens: 0, joined: 0 },
+      initial: "start",
+      states: {
+        start: {
+          entry: (_, enq) => {
+            enq.spawn("child", { id: "c1" });
+            enq.spawn("child", { id: "c2" });
+          },
+          always: { target: "researching" },
+        },
+        researching: {
+          on: {
+            [AGENT_USAGE_EVENT_TYPE]: ({ context, event }) => ({
+              context: { ...context, tokens: context.tokens + (event.usage.totalTokens ?? 0) },
+            }),
+            "xstate.done.actor": ({ context }) => ({
+              context: { ...context, joined: context.joined + 1 },
+            }),
+          },
+          always: ({ context }) => (context.joined === 2 ? { target: "done" } : undefined),
+        },
+        done: { type: "final" },
+      },
+    });
+    const result = await runAgent(parent, {
+      executors: {
+        generateText: async () => {
+          await Promise.resolve();
+          return { result: "s", usage: { totalTokens: 100 } };
+        },
+      },
+    });
+    expect(result.status).toBe("done");
+    expect(result.snapshot.context.tokens).toBe(200);
+  });
+});
+
+describe("onIdle passes with a persisted child", () => {
+  test("an inspector sees the child once across passes", async () => {
+    const worker = setupAgent({
+      context: z.object({}),
+      events: { PING: z.object({}) },
+    }).createMachine({ context: {}, initial: "idle", states: { idle: { on: { PING: {} } } } });
+    const parent = setupAgent({
+      context: z.object({}),
+      events: { NEXT: z.object({}), STOP: z.object({}) },
+      actors: { worker },
+    }).createMachine({
+      id: "parent",
+      context: {},
+      invoke: { id: "worker", src: "worker" },
+      initial: "waiting",
+      states: {
+        waiting: { on: { NEXT: {}, STOP: { target: "done" } } },
+        done: { type: "final" },
+      },
+    });
+    const announced = new Map<string, number>();
+    let answers = 0;
+    const result = await runAgent(parent, {
+      inspect: (event) => {
+        if (event.type !== "@xstate.actor") return;
+        const id = (event.actorRef as { id?: string }).id ?? "";
+        announced.set(id, (announced.get(id) ?? 0) + 1);
+      },
+      onIdle: async () => (answers++ < 2 ? { type: "NEXT" as const } : { type: "STOP" as const }),
+    });
+    expect(result.status).toBe("done");
+    expect(Object.fromEntries(announced)).toEqual({ parent: 1, worker: 1 });
+  });
+});

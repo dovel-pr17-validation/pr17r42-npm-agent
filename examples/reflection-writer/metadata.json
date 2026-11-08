@@ -1,0 +1,25 @@
+{
+  "name": "reflection-writer",
+  "title": "Write an essay, critique it, revise it",
+  "kind": "pattern",
+  "origin": {
+    "type": "langgraph",
+    "source": "LangGraph's Reflection tutorial (essay writer: generate <-> reflect loop), rebuilt as an explicit machine",
+    "url": "https://langchain-ai.github.io/langgraph/tutorials/reflection/reflection/"
+  },
+  "comparison": {
+    "targets": ["LangGraph"],
+    "purpose": "A write-critique-revise loop with a hard stop: a typed guard ends it when the critic signs off or after 2 rewrites, whichever comes first. A run that spends the budget says \"best effort\" instead of claiming the critic approved it, and a failed model call lands in its own failed state."
+  },
+  "starters": [
+    "Why cities should ban cars from their downtown cores",
+    "The case for a four-day work week",
+    "Whether AI tutors help or hurt students",
+    {
+      "label": "Carbon tax vs. cap-and-trade (hard topic)",
+      "input": {
+        "topic": "Whether a carbon tax or cap-and-trade better cuts emissions, weighing the strongest objection to your position and citing concrete policy outcomes"
+      }
+    }
+  ]
+}

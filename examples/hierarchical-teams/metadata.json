@@ -1,0 +1,20 @@
+{
+  "name": "hierarchical-teams",
+  "title": "A research team and a writing team, with managers",
+  "kind": "multi-agent",
+  "origin": {
+    "type": "langgraph",
+    "source": "LangGraph hierarchical agent teams tutorial",
+    "url": "https://github.com/langchain-ai/langgraph/blob/23961cff61a42b52525f3b20b4094d8d2fba1744/docs/docs/tutorials/multi_agent/hierarchical_agent_teams.ipynb"
+  },
+  "comparison": {
+    "targets": ["LangGraph hierarchical teams"],
+    "purpose": "Two teams under one coordinator, each team its own child machine with typed input and output. The research manager picks SEARCH, SCRAPE or FINISH each turn, but after a two-step worker budget the guards leave only FINISH; the writing team drafts from what came back, and the coordinator may send it back for research once before PUBLISH is the only way out."
+  },
+  "starters": [
+    "One reason RISC-V matters for data centers.",
+    "One way tokenization trips up LLM arithmetic.",
+    "Which way are grid-scale battery costs moving?"
+  ],
+  "machine": "hierarchicalTeamsMachine"
+}

@@ -1,0 +1,229 @@
+export { AgentError, AgentTruncatedError } from "./errors.js";
+export type {
+  ContextOf,
+  DoneActorEventOf,
+  EventOf,
+  InputOf,
+  MetaOf,
+  OutputOf,
+  RequestNamesOf,
+  SnapshotOf,
+  StateValueOf,
+} from "./type-helpers.js";
+export { isAgentMessages, messagesSchema } from "./messages.js";
+export { createAgentSchemas, getAgentSchemas, setupAgent } from "./setup-agent.js";
+export type {
+  AgentDefaultMeta,
+  AgentSchemaPack,
+  SetupAgentResult,
+  // Both appear in `setupAgent`'s inferred result type (its event schemas
+  // always carry the reserved `'@agent.usage'` entry), so consumers' declaration
+  // emit needs them nameable.
+  AgentUsageEventPayload,
+  WithAgentEvents,
+  WithAgentUsageEvent,
+} from "./setup-agent.js";
+export {
+  AgentDecisionExhaustedError,
+  createDecisionLogic,
+  createDecisionRequest,
+  renderDecisionAttempts,
+  resolveDecision,
+} from "./decision.js";
+export type {
+  AgentDecisionInput,
+  AgentExecutorDecisionRequest,
+  AgentDecisionRequest,
+  AgentDecisionExecutor,
+  AgentDecisionRejection,
+  AgentDecisionOption,
+  DecisionAttempt,
+  // Return type of `createDecisionLogic`, so declaration emit can name it.
+  DecisionLogic,
+  DecisionLogicConfig,
+  CreateDecisionRequestOptions,
+  ResolveDecisionOptions,
+} from "./decision.js";
+export { ACT_STATE_EXITED, DEFAULT_ACT_MAX_STEPS } from "./act.js";
+export type { AgentActInput } from "./act.js";
+export { GROUPED_EVENT_THRESHOLD, MAX_FINITE_PAYLOADS } from "./decision-strategy.js";
+export type { DecisionStrategy } from "./decision-strategy.js";
+export { AgentInvalidEventPayloadError, getAcceptedEvents, parseAgentEvent } from "./events.js";
+export { eventFromInteraction, getInteraction, interactionMetaSchema } from "./interaction.js";
+export type {
+  AgentInteraction,
+  AgentInteractionChoice,
+  AgentInteractionDescriptor,
+  AgentInteractionEvent,
+  AgentInteractionEventMeta,
+  AgentInteractionMeta,
+  GetInteractionOptions,
+} from "./interaction.js";
+export type {
+  AgentRequestOptions,
+  EventFromSnapshot,
+  // Named return type of `getAgentSchemas`, so declaration emit can name it.
+  AgentSchemas,
+  AgentEventDescriptor,
+  AgentRequestSource,
+} from "./events.js";
+export {
+  bindRequestExecutor,
+  providerOutputSchema,
+  createTextLogic,
+  getAgentOutputMode,
+  getCallFinishReason,
+  getCallUsage,
+  parseOutput,
+  parseProviderOutput,
+} from "./text-logic.js";
+export type {
+  AgentFinishReason,
+  AgentModelMap,
+  AgentModelRef,
+  AgentRequestMode,
+  BuiltinAgentActors,
+  AgentOutputMode,
+  ProviderStructuredOutput,
+  AgentExecutorTextRequest,
+  AgentTextRequest,
+  AgentRequestExecutor,
+  AgentRequestExecutorInfo,
+  AgentRequestExecutorResult,
+  AgentRequestExecutors,
+  AgentTextResult,
+  AgentUsage,
+  AgentCallUsage,
+  TextLogic,
+  TextLogicConfig,
+  TextLogicExecuteArgs,
+  TextLogicExecutor,
+} from "./text-logic.js";
+export type { AgentRequest, AgentStepRequest } from "./steps.js";
+export { AGENT_USAGE_EVENT_TYPE } from "./usage.js";
+export { describeMachine } from "./describe-machine.js";
+export type { DescribeMachineOptions } from "./describe-machine.js";
+export { decideNext } from "./decide-next.js";
+export type { DecideNextOptions, DecideNextResult } from "./decide-next.js";
+export { createPolicyDecider } from "./policy-decider.js";
+export type { PolicyDeciderOptions } from "./policy-decider.js";
+export type { AgentUsageEvent } from "./usage.js";
+// The event log itself (replay, forking, hand-built entries, stores) lives in
+// `@statelyai/agent/log`. The root keeps only what the agent runtime reads and
+// returns, and the errors it can throw.
+export { AgentMachineVersionMismatchError } from "./event-log.js";
+export type { AgentLogEntry } from "./event-log.js";
+export { AgentEventLogConflictError } from "./event-log-store.js";
+export type { AgentEventLogStore } from "./event-log-store.js";
+export {
+  AGENT_TRACE_SCHEMA_VERSION,
+  AgentMaxModelCallsExceededError,
+  AgentSnapshotDivergedError,
+  createAgentInbox,
+  createAgentRuntime,
+  inspectTransitions,
+  isAgentIdle,
+  runAgent,
+  runToQuiescence,
+  serializeTraceEvent,
+  traceTransitions,
+} from "./run-agent.js";
+export type {
+  AgentEffects,
+  AgentInbox,
+  AgentRunInit,
+  AgentRunOptions,
+  AgentRunStart,
+  AgentRuntime,
+  AgentRuntimeOptions,
+  AgentTimerEvent,
+  AgentTimerScheduler,
+} from "./run-agent.js";
+export type {
+  AgentInputFrom,
+  AgentRunMeta,
+  AgentTransitionHandler,
+  AgentTraceEvent,
+  InspectedActorRef,
+  JsonSerializableTraceEvent,
+  AgentRunResult,
+  AgentRunErrorCause,
+} from "./run-agent.js";
+export { wrapWorkflow } from "./wrap-workflow.js";
+export type {
+  EffectCallEvent,
+  EffectDoneEvent,
+  EffectErrorEvent,
+  WorkflowEffects,
+  WorkflowRunContext,
+  WrappedWorkflow,
+  WrappedWorkflowContext,
+  WrappedWorkflowEvent,
+  WrappedWorkflowMachine,
+  WrappedWorkflowRunOptions,
+  WrapWorkflowConfig,
+} from "./wrap-workflow.js";
+export { provideExecutors } from "./provide-executors.js";
+export type { ProvideExecutorsOptions } from "./provide-executors.js";
+export {
+  assistantMessage,
+  getJsonSchema,
+  getJsonSchemaSync,
+  getMessageText,
+  getMachineStructuralHash,
+  getStateMeta,
+  getStatePath,
+  isStandardSchema,
+  systemMessage,
+  toolMessage,
+  userMessage,
+} from "./utils.js";
+export type { MetaOfSnapshot } from "./utils.js";
+export type {
+  AgentWorkflowActionConfig,
+  AgentWorkflowActorConfig,
+  AgentWorkflowConfig,
+  AgentWorkflowInvokeConfig,
+  AgentWorkflowStateConfig,
+  AgentWorkflowRequestConfig,
+  AgentWorkflowTransitionConfig,
+  FromConfigOptions,
+  FromConfigResult,
+  SchemaCompiler,
+} from "./workflow-config.js";
+// Every type below can appear in the inferred type of a machine, runtime, or
+// run result, so consumers' declaration emit (`declaration`/`composite`) must
+// be able to name it through this entry instead of an internal dist chunk.
+export type {
+  AgentEventSchemaInput,
+  AgentEventSchemaInputMap,
+  AgentMessage,
+  AgentTool,
+  AgentToolChoice,
+  AgentToolDescriptor,
+  AgentToolExecute,
+  AgentTools,
+  AgentToolSchema,
+  AllowedEventPattern,
+  AllowedEvents,
+  AssistantMessage,
+  ChosenEvent,
+  DataContent,
+  EventPayload,
+  EventUnion,
+  FilePart,
+  ImagePart,
+  InferInput,
+  InferOutput,
+  NormalizedEventSchemas,
+  ProviderOptions,
+  StandardSchemaV1,
+  SystemMessage,
+  TextPart,
+  ToolCallPart,
+  ToolMessage,
+  ToolResultOutput,
+  ToolResultPart,
+  UserMessage,
+  WithAgentInputSchema,
+} from "./types.js";

@@ -1,0 +1,387 @@
+/**
+ * Joke teller — a machine-owned tell → rate → decide loop, ported from the v1
+ * `joke-teller` example.
+ *
+ * Flow: get a topic from the user → stream a joke about it → rate it 1-10 with
+ * an explanation (a Jev judgment, see below) → ALWAYS take one improvement pass (the machine, not the
+ * model, guarantees the first revision) → then let the model DECIDE (not a
+ * regex) whether to keep going or stop. The decision is an `agent.decide`
+ * invoke; the state's own `on:` transitions define the legal choices, so the
+ * state machine owns the loop.
+ *
+ * The branch after each rating lives in a `type: "choice"` state
+ * (`checkingRating`), not inside an `onDone` handler, so `explorePaths` and
+ * `canReach` can see all three outcomes: revise, ask the model, or stop at the
+ * `MAX_JOKES` cap. Any request failure lands in a `failed` final state.
+ *
+ * Rating is a JUDGMENT, not a generation. `rateJoke` asks the AI SDK's
+ * `experimental_decide` with Jev (`@ai-sdk/typesafe-ai`) as the evaluation
+ * model one `score` question, `rating`, over `{ joke }` on five concrete
+ * levels (`JOKE_LEVELS`), lowest to highest. The machine maps the level to the
+ * 1-10 rating it already stores as `1 + score / (levels - 1) * 9`, and the
+ * explanation is the matched level's description. Telling the joke stays a
+ * streamed text request, and the keep-going decision stays `agent.decide`.
+ *
+ * Dual-mode: `runAgent` takes host executors, so the same machine runs live
+ * against real models (readline topic, streaming to stdout) or against mocked
+ * executors in tests. See index.test.ts.
+ *
+ * Run: OPENAI_API_KEY=... TYPESAFE_AI_API_KEY=... npx tsx examples/joke/index.ts
+ */
+import { z } from "zod";
+import { openai } from "@ai-sdk/openai";
+import { createAsyncLogic } from "xstate";
+import { experimental_decide, type Experimental_DecisionModel } from "ai";
+import { typeSafeAi } from "@ai-sdk/typesafe-ai";
+import { createAiSdkExecutors } from "@statelyai/agent/ai-sdk";
+import {
+  createAgentSchemas,
+  createTextLogic,
+  getStatePath,
+  createAgentRuntime,
+  runToQuiescence,
+  setupAgent,
+} from "@statelyai/agent";
+
+const DEFAULT_TOPIC = "state machines";
+
+/** Hard cap on jokes told, so a run stays short no matter what the model decides. */
+const MAX_JOKES = 3;
+
+const funnyPhrases = [
+  "Concocting chuckles...",
+  "Brewing belly laughs...",
+  "Fabricating funnies...",
+  "Whipping up wisecracks...",
+  "Hatching howlers...",
+];
+const ratingPhrases = [
+  "Assessing amusement...",
+  "Evaluating hilarity...",
+  "Judging jollity...",
+  "Measuring merriment...",
+];
+const pick = (phrases: string[]) => phrases[Math.floor(Math.random() * phrases.length)]!;
+
+export const jokeSchemas = createAgentSchemas({
+  context: z.object({
+    topic: z.string(),
+    jokes: z.array(z.string()),
+    lastRating: z.number().nullable(),
+    lastExplanation: z.string().nullable(),
+    // What the critic said about the FIRST attempt. Kept so the run can show a
+    // before/after; the sentence itself is rendered in `output`, not stored.
+    firstRating: z.number().nullable(),
+    firstExplanation: z.string().nullable(),
+    error: z.string().nullable(),
+  }),
+  input: z.object({ topic: z.string().default(DEFAULT_TOPIC) }),
+  output: z.object({
+    status: z.enum(["told", "failed"]),
+    joke: z.string().nullable(),
+    revisionNotice: z.string().nullable(),
+    topic: z.string(),
+    /** Every joke told before `joke`, first attempt first. */
+    earlierJokes: z.array(z.string()),
+    lastRating: z.number().nullable(),
+    error: z.string().nullable(),
+  }),
+  events: {
+    // Loop-control events the model chooses between in `deciding`.
+    TELL_ANOTHER: z.object({}),
+    END: z.object({}),
+  },
+});
+
+const models = {
+  jokeWriter: openai("gpt-6-luna"),
+  critic: openai("gpt-6-luna"),
+};
+
+/**
+ * The judge: TypeSafe's Jev through the AI SDK's decision-model provider.
+ * Reads `TYPESAFE_AI_API_KEY`. Tests pass a mock decision model instead.
+ */
+const judgeModel: Experimental_DecisionModel = typeSafeAi.decisionModel("jev-latest");
+
+export const tellJoke = createTextLogic({
+  mode: "stream",
+  // Stamped onto every lowered request as `request.name`, so hosts, traces and
+  // test executors can route on it instead of sniffing the prompt.
+  name: "tellJoke",
+  schemas: {
+    input: z.object({
+      topic: z.string(),
+      // Set on the improvement pass: the joke to beat and the critic's reasons.
+      previousJoke: z.string().nullable(),
+      rating: z.number().nullable(),
+      critique: z.string().nullable(),
+    }),
+    output: z.string(),
+  },
+  model: "jokeWriter",
+  system: "You tell short, punchy jokes. Stay on topic.",
+  prompt: ({ input }) =>
+    input.previousJoke
+      ? [
+          `Previous joke about ${input.topic}:`,
+          input.previousJoke,
+          `A critic scored it ${input.rating ?? "?"}/10: ${input.critique ?? ""}`,
+          "Rewrite it so it lands harder. Return only the new joke.",
+        ].join("\n")
+      : `Tell a joke about ${input.topic}.`,
+});
+
+/** How well a joke lands, lowest to highest (mapped to a 1-10 rating). */
+export const JOKE_LEVELS = [
+  "Not a joke: no setup or punchline, or nothing that reads as humorous.",
+  "Has the shape of a joke, but the punchline does not follow from the setup.",
+  "A coherent joke whose punchline is predictable or a pun most listeners have heard.",
+  "A clever joke whose punchline surprises and fits the setup; it would get a smile.",
+  "A sharp joke whose punchline recasts the setup in an unexpected, specific way; it would get a real laugh.",
+] as const;
+
+/**
+ * The critic as a judgment: the joke is the state, and one `score` question
+ * places it on `JOKE_LEVELS`. The judge model is injected by tests and hosts;
+ * the default is Jev.
+ */
+export function createRateJoke(model: Experimental_DecisionModel = judgeModel) {
+  return createAsyncLogic<{ answers: { rating: { score: number } } }, { joke: string }>({
+    run: async ({ input, signal }) => {
+      const { answers } = await experimental_decide({
+        model,
+        state: { joke: input.joke },
+        questions: {
+          rating: {
+            type: "score" as const,
+            instructions: "How well does `joke` land as a joke?",
+            criteria: JOKE_LEVELS,
+          },
+        },
+        abortSignal: signal,
+      });
+      return { answers };
+    },
+  });
+}
+
+export const rateJoke = createRateJoke();
+
+/** A `JOKE_LEVELS` answer as the 1-10 rating and the matched level's text. */
+function toRating(level: number) {
+  const top = JOKE_LEVELS.length - 1;
+  return {
+    lastRating: Math.round(1 + (level / top) * 9),
+    lastExplanation: JOKE_LEVELS[Math.round(level)] ?? "",
+  };
+}
+
+export const jokeActors = { tellJoke, rateJoke };
+
+const jokeAgentSetup = setupAgent({
+  schemas: jokeSchemas,
+  models,
+  actors: jokeActors,
+});
+
+type JokeContext = z.infer<typeof jokeSchemas.context>;
+
+/**
+ * The prose part of the run summary. Rendered here, at the end of the run,
+ * rather than stored in context: it is derived from `firstRating` /
+ * `firstExplanation` and would otherwise need hand-keeping in sync.
+ */
+function describeRun(context: JokeContext) {
+  return {
+    revisionNotice:
+      context.firstRating === null
+        ? null
+        : `First attempt scored ${context.firstRating}/10 ` +
+          `(${(context.firstExplanation ?? "").replace(/\.$/, "")}). ` +
+          "Every run takes one improvement pass before deciding whether to stop.",
+    topic: context.topic,
+    lastRating: context.lastRating,
+    error: context.error,
+  };
+}
+
+const DECIDE_SYSTEM =
+  "You decide whether a joke-teller keeps going. If the last joke rated 7 or " +
+  "higher it was good enough — END. Otherwise TELL_ANOTHER to try again.";
+
+export const jokeMachine = jokeAgentSetup.createMachine({
+  id: "joke-teller",
+  context: ({ input }) => ({
+    topic: input.topic,
+    jokes: [],
+    lastRating: null,
+    lastExplanation: null,
+    firstRating: null,
+    firstExplanation: null,
+    error: null,
+  }),
+  initial: "telling",
+  states: {
+    telling: {
+      invoke: {
+        src: "tellJoke",
+        // After the first pass the writer sees the joke to beat and the
+        // critique, so `telling` doubles as the revision step.
+        input: ({ context }) => ({
+          topic: context.topic,
+          previousJoke: context.jokes.at(-1) ?? null,
+          rating: context.lastRating,
+          critique: context.lastExplanation,
+        }),
+        onDone: ({ context, output }) => ({
+          target: "rating",
+          context: { jokes: [...context.jokes, output.result] },
+        }),
+        onError: ({ event }) => ({
+          target: "failed",
+          context: { error: `tellJoke failed: ${String(event.error)}` },
+        }),
+      },
+    },
+    rating: {
+      invoke: {
+        src: "rateJoke",
+        input: ({ context }) => ({ joke: context.jokes.at(-1) ?? "" }),
+        onDone: ({ output }) => ({
+          target: "checkingRating",
+          context: toRating(output.answers.rating.score),
+        }),
+        onError: ({ event }) => ({
+          target: "failed",
+          context: { error: `rateJoke failed: ${String(event.error)}` },
+        }),
+      },
+    },
+    // The whole loop branch, in one named node. Three outcomes, all visible to
+    // `explorePaths`/`canReach`.
+    checkingRating: {
+      type: "choice",
+      choice: ({ context }) => {
+        // The first joke ALWAYS gets one improvement pass. The machine owns
+        // that rule, so the revision branch shows up on every run instead of
+        // depending on whatever the critic happened to score.
+        if (context.jokes.length === 1) {
+          return {
+            target: "telling",
+            context: {
+              firstRating: context.lastRating,
+              firstExplanation: context.lastExplanation,
+            },
+          };
+        }
+        // Past that, the model decides — unless the run hits its joke cap.
+        return context.jokes.length >= MAX_JOKES ? { target: "done" } : { target: "deciding" };
+      },
+    },
+    deciding: {
+      invoke: {
+        src: "agent.decide",
+        input: ({ context }) => ({
+          model: "critic",
+          system: DECIDE_SYSTEM,
+          prompt: [
+            `Last joke rating: ${context.lastRating}`,
+            `Explanation: ${context.lastExplanation ?? ""}`,
+            "Choose TELL_ANOTHER or END.",
+          ].join("\n"),
+          // allowedEvents omitted: the state's `on:` below fully defines the
+          // legal set (TELL_ANOTHER | END), and the chosen event is delivered
+          // automatically — its transition exits `deciding`, ending the invoke.
+          maxRetries: 2,
+        }),
+        onError: ({ event }) => ({
+          target: "failed",
+          context: { error: `agent.decide failed: ${String(event.error)}` },
+        }),
+      },
+      on: {
+        TELL_ANOTHER: { target: "telling" },
+        END: { target: "done" },
+      },
+    },
+    done: {
+      type: "final",
+      output: ({ context }) => ({
+        status: "told" as const,
+        joke: context.jokes.at(-1) ?? null,
+        earlierJokes: context.jokes.slice(0, -1),
+        ...describeRun(context),
+      }),
+    },
+    // A request failure is its own outcome, not a `done` with an empty joke.
+    failed: {
+      type: "final",
+      output: ({ context }) => ({
+        status: "failed" as const,
+        joke: null,
+        // No joke made it through, so every one told is an earlier one.
+        earlierJokes: context.jokes,
+        ...describeRun(context),
+      }),
+    },
+  },
+});
+
+/** Prompt once on stdin and resolve the trimmed reply. */
+async function promptLine(query: string): Promise<string> {
+  const { createInterface } = await import("node:readline/promises");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return (await rl.question(query)).trim();
+  } finally {
+    rl.close();
+  }
+}
+
+async function promptTopic(): Promise<string> {
+  return (await promptLine("Give me a joke topic > ")) || DEFAULT_TOPIC;
+}
+
+export async function main() {
+  const topic = process.stdin.isTTY ? await promptTopic() : DEFAULT_TOPIC;
+
+  const result = await runToQuiescence(
+    createAgentRuntime(jokeMachine, {
+      executors: createAiSdkExecutors(jokeMachine),
+      onChunk: (chunk) => process.stdout.write(chunk),
+      onTransition: (snapshot) => {
+        const path = getStatePath(snapshot);
+        if (path === "telling") console.log(`\n${pick(funnyPhrases)}`);
+        if (path === "rating") console.log(`\n${pick(ratingPhrases)}`);
+      },
+    }),
+    {
+      input: { topic },
+    },
+  );
+
+  if (result.status !== "done") {
+    throw new Error(`Joke agent did not complete: ${result.status}`);
+  }
+  if (result.output.status === "failed") {
+    throw new Error(result.output.error ?? "The joke agent failed.");
+  }
+  if (result.output.revisionNotice) console.log(`\n\n${result.output.revisionNotice}`);
+  console.log(
+    `\nTold ${result.output.earlierJokes.length + 1} joke(s) about "${result.output.topic}". ` +
+      `Final rating: ${result.output.lastRating}`,
+  );
+}
+
+// Run directly (`tsx index.ts`); skipped when a test imports this module.
+if (import.meta.url === new URL(process.argv[1]!, "file:").href) {
+  if (!process.env.OPENAI_API_KEY || !process.env.TYPESAFE_AI_API_KEY) {
+    console.error("Set OPENAI_API_KEY and TYPESAFE_AI_API_KEY to run this example.");
+    process.exit(1);
+  }
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

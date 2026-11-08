@@ -1,0 +1,381 @@
+/**
+ * Client-safe vocabulary for the unified machine chat UI.
+ *
+ * The chat works with ANY machine via three ingredients read off the live
+ * snapshot on the server:
+ *
+ * 1. `getAcceptedEvents(snapshot, { events: machine.schemas.events })` — what
+ *    the machine accepts right now, each with an optional payload schema.
+ * 2. JSON Schema per event (Standard Schema `~standard.jsonSchema` / Zod
+ *    `z.toJSONSchema`) — drives the generated payload form.
+ * 3. The `meta.interaction` convention — optional per-state hints authored in
+ *    the machine definition:
+ *
+ *    ```ts
+ *    meta: {
+ *      interaction: {
+ *        // Labels may reference runtime context with `{key}` placeholders,
+ *        // resolved against `snapshot.context` when the state is presented
+ *        // (e.g. "{notice} Another round?"). XState `meta` is static, so this
+ *        // is how a label surfaces runtime state.
+ *        label: "Amount exceeds the limit. Approve or deny.",
+ *        events: {
+ *          APPROVE: { label: "Approve refund", style: "primary" },
+ *          DENY: { label: "Deny", style: "danger" },
+ *        },
+ *        // Payload choices: one button per full event ("Seat 2",
+ *        // "Refund $240"). A string instead names a context array of the
+ *        // same shape for choices computed at runtime.
+ *        choices: [{ label: "Seat 2", event: { type: "ACCUSE", seat: 2 } }],
+ *        // Free chat text becomes this event (payload from its single
+ *        // string field, or `{ type, field }` to name the field) — directly
+ *        // when it is the only thing text can mean, else as one of the
+ *        // readings Jev chooses among.
+ *        textEvent: "REJECT",
+ *        // Optional custom composer renderer for this state ("rating",
+ *        // "cards"). Unknown names fall back to the schema form.
+ *        component: "rating",
+ *      },
+ *    }
+ *    ```
+ */
+
+/**
+ * Every run needs a text model (OpenAI) and Jev (TypeSafe) for its judgments.
+ * The server checks both and the shell names whichever is missing.
+ */
+export const REQUIRED_KEYS = ["OPENAI_API_KEY", "TYPESAFE_AI_API_KEY"] as const;
+
+export type RequiredKey = (typeof REQUIRED_KEYS)[number];
+
+export const MISSING_KEY_MESSAGE =
+  "Set OPENAI_API_KEY and TYPESAFE_AI_API_KEY on the demo server to run examples.";
+
+/** The required keys `env` lacks. Server-side callers pass `process.env`. */
+export function missingKeys(env: Record<string, string | undefined>): RequiredKey[] {
+  return REQUIRED_KEYS.filter((key) => !env[key]);
+}
+
+/** The shared message, naming the missing key(s) when known. */
+export function missingKeyMessage(missing: readonly RequiredKey[]): string {
+  return missing.length
+    ? `${MISSING_KEY_MESSAGE} Missing: ${missing.join(", ")}.`
+    : MISSING_KEY_MESSAGE;
+}
+
+export type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
+
+export type JsonObject = { [key: string]: Json };
+
+export type AcceptedEventStyle = "primary" | "danger" | "default";
+
+export type AcceptedEvent = {
+  type: string;
+  /** Button label: interaction hint, else the humanized event type. */
+  label: string;
+  style: AcceptedEventStyle;
+  /** JSON Schema of the event payload (sans `type`), when one is registered. */
+  jsonSchema: JsonObject | null;
+  /** True when sending this event needs user-provided payload fields. */
+  needsPayload: boolean;
+  /** True when the state's payload choices cover this event type, so it gets no button of its own. */
+  coveredByChoices?: boolean;
+};
+
+/** One payload choice from `meta.interaction.choices`: a button sending a full event. */
+export type InteractionChoice = {
+  label: string;
+  style: AcceptedEventStyle;
+  event: { type: string } & JsonObject;
+};
+
+/** One pending host-owned timer: the id to deliver back and its delay in ms. */
+export type PendingTimer = { id: string; delay: number };
+
+/** What an idle machine is waiting on — enough for a generic chat UI. */
+export type ChatIdle = {
+  /** Human prompt from `meta.interaction.label`, if declared. */
+  prompt: string | null;
+  events: AcceptedEvent[];
+  /**
+   * Payload choices the snapshot accepts right now, from
+   * `meta.interaction.choices`. Absent when the state declares none.
+   */
+  choices?: InteractionChoice[];
+  /**
+   * Event type that free chat text maps to while idle (its single string
+   * field carries the text), from `meta.interaction.textEvent` or inferred
+   * when exactly one accepted event takes exactly one string field. When it
+   * is the only reading of free text (see `textCandidates`), text is sent as
+   * it directly; when other actions are on offer too, Jev chooses among all of
+   * them, so "looks good" is not sent as feedback.
+   */
+  textEvent: { type: string; field: string } | null;
+  /**
+   * Host-owned `after` timers the idle machine is waiting on (a deadline),
+   * with their delay from when the run settled. The client fires each one by
+   * resuming with `{ type: "xstate.timer", id }` unless something else is sent
+   * first. Absent when none is pending.
+   */
+  timers?: PendingTimer[];
+  /**
+   * Optional custom composer renderer name from
+   * `meta.interaction.component` (e.g. "rating", "cards"). Null when the
+   * state declares none; unknown names fall back to the schema form.
+   */
+  component: string | null;
+};
+
+/** "AUTO_REFUND" → "Auto refund". */
+export function humanizeEventType(type: string): string {
+  const words = type
+    .replace(/[_.-]+/g, " ")
+    .trim()
+    .toLowerCase();
+  return words ? words[0].toUpperCase() + words.slice(1) : type;
+}
+
+/**
+ * Field/property name → readable label: splits camelCase, snake_case and
+ * kebab-case, preserving ALL-CAPS acronyms ("maxRounds" → "Max rounds",
+ * "playerHP" → "Player HP").
+ */
+export function humanizeFieldName(name: string): string {
+  const tokens = name
+    .replace(/[_.-]+/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (!tokens.length) return name;
+  return tokens
+    .map((token, index) => {
+      // Keep acronyms as authored ("HP", "URL"); otherwise sentence-case.
+      if (token.length > 1 && token === token.toUpperCase() && /[A-Z]/.test(token)) return token;
+      const lower = token.toLowerCase();
+      return index === 0 ? lower[0].toUpperCase() + lower.slice(1) : lower;
+    })
+    .join(" ");
+}
+
+export type SchemaField = {
+  name: string;
+  label: string;
+  required: boolean;
+  description: string | null;
+  kind:
+    | { type: "string"; multiline: boolean }
+    | { type: "number"; integer: boolean }
+    | { type: "boolean" }
+    | { type: "enum"; options: string[] }
+    | { type: "json" };
+  defaultValue: Json | undefined;
+};
+
+function fieldKind(schema: JsonObject): SchemaField["kind"] {
+  const values = schema.enum;
+  if (Array.isArray(values) && values.every((value) => typeof value === "string")) {
+    return { type: "enum", options: values as string[] };
+  }
+  switch (schema.type) {
+    case "string": {
+      const max = typeof schema.maxLength === "number" ? schema.maxLength : null;
+      return { type: "string", multiline: max === null || max > 120 };
+    }
+    case "integer":
+      return { type: "number", integer: true };
+    case "number":
+      return { type: "number", integer: false };
+    case "boolean":
+      return { type: "boolean" };
+    default:
+      // Nested objects, arrays, unions: raw JSON editor fallback.
+      return { type: "json" };
+  }
+}
+
+/**
+ * Flattens an object JSON Schema into renderable form fields. Returns null
+ * when the schema is not an object schema (the dialog then falls back to one
+ * raw JSON field for the whole payload).
+ */
+export function schemaFields(schema: JsonObject): SchemaField[] | null {
+  if (schema.type !== "object" && !schema.properties) return null;
+  const properties = (schema.properties ?? {}) as Record<string, JsonObject>;
+  const required = new Set(Array.isArray(schema.required) ? (schema.required as string[]) : []);
+  return Object.entries(properties).map(([name, property]) => ({
+    name,
+    label: humanizeFieldName(name),
+    required: required.has(name),
+    description: typeof property.description === "string" ? property.description : null,
+    kind: fieldKind(property ?? {}),
+    defaultValue: property?.default as Json | undefined,
+  }));
+}
+
+/** True when the payload schema declares at least one property to fill in. */
+export function schemaNeedsPayload(schema: JsonObject | null): boolean {
+  if (!schema) return false;
+  const fields = schemaFields(schema);
+  if (fields === null) return true;
+  return fields.length > 0;
+}
+
+/** The single string property name, when the schema is exactly that. */
+export function singleStringField(schema: JsonObject | null): string | null {
+  if (!schema) return null;
+  const fields = schemaFields(schema);
+  if (!fields || fields.length !== 1) return null;
+  const [field] = fields;
+  return field.kind.type === "string" ? field.name : null;
+}
+
+/**
+ * One reading of free chat text as an offered event: the server asks Jev
+ * which candidate the text means. `fill` names the string field that carries
+ * the text itself.
+ */
+export type TextCandidate = {
+  event: { type: string } & JsonObject;
+  /** What the choice means, in the words the buttons use. */
+  description: string;
+  fill: string | null;
+  /** Replies that name this choice outright ("Rock", "Cleo", "2"). */
+  names: string[];
+};
+
+/** Most values a numeric field may offer before free text stops expanding it. */
+const MAX_NUMERIC_CHOICES = 12;
+
+/**
+ * The values a numeric payload field offers as separate choices: an enum of
+ * numbers, or an integer range with both bounds (a seat 0–3, a rating 1–5).
+ * Null when the field is open-ended or offers too many values to list.
+ */
+function numericChoices(schema: JsonObject | undefined): number[] | null {
+  if (!schema) return null;
+  const values = schema.enum;
+  if (Array.isArray(values)) {
+    return values.length <= MAX_NUMERIC_CHOICES &&
+      values.every((value) => typeof value === "number")
+      ? (values as number[])
+      : null;
+  }
+  if (schema.type !== "integer" && schema.type !== "number") return null;
+  const low =
+    typeof schema.minimum === "number"
+      ? Math.ceil(schema.minimum)
+      : typeof schema.exclusiveMinimum === "number"
+        ? Math.floor(schema.exclusiveMinimum) + 1
+        : null;
+  const high =
+    typeof schema.maximum === "number"
+      ? Math.floor(schema.maximum)
+      : typeof schema.exclusiveMaximum === "number"
+        ? Math.ceil(schema.exclusiveMaximum) - 1
+        : null;
+  if (low === null || high === null || high < low || high - low + 1 > MAX_NUMERIC_CHOICES) {
+    return null;
+  }
+  return Array.from({ length: high - low + 1 }, (_, index) => low + index);
+}
+
+/**
+ * What a field's own description says one value means, when it documents its
+ * values as `0=Ada, 1=Bruno` (or `0: Ada`), so "Cleo" can pick seat 2.
+ */
+function valueMeaning(description: string | null, value: number): string | null {
+  const match = description?.match(new RegExp(`(?:^|[\\s,;(])${value}\\s*[=:]\\s*([^,;)]+)`));
+  return match ? match[1]!.trim() : null;
+}
+
+/**
+ * The ways free text can map onto the accepted events without a form:
+ * a payload-free event is one candidate; an event whose payload is one enum
+ * field, or one small bounded number field, is one candidate per value
+ * (ACCUSE with seat 2); an event whose payload is one string field takes the
+ * whole text. Events that need more than that are left to their buttons.
+ * A state's payload `choices` are one candidate each, named by their label,
+ * and replace the events they cover: "Refund $240" picks that refund, and no
+ * covered event takes the whole text as its payload.
+ */
+export function textCandidates(
+  events: AcceptedEvent[],
+  choices: InteractionChoice[] = [],
+): TextCandidate[] {
+  const fromChoices = choices.map((choice): TextCandidate => ({
+    event: choice.event,
+    description: `Chooses "${choice.label}".`,
+    fill: null,
+    names: [choice.label],
+  }));
+  return fromChoices.concat(
+    events.flatMap((event): TextCandidate[] => {
+      if (event.coveredByChoices) return [];
+      return eventCandidates(event);
+    }),
+  );
+}
+
+function eventCandidates(event: AcceptedEvent): TextCandidate[] {
+  const action = `"${event.label}"`;
+  if (!event.needsPayload) {
+    return [
+      {
+        event: { type: event.type },
+        description: `Chooses ${action}.`,
+        fill: null,
+        names: [event.label],
+      },
+    ];
+  }
+  const fields = event.jsonSchema ? schemaFields(event.jsonSchema) : null;
+  if (!fields || fields.length !== 1) return [];
+  const [field] = fields;
+  const name = field.label.toLowerCase();
+  if (field.kind.type === "enum") {
+    return field.kind.options.map((option) => ({
+      event: { type: event.type, [field.name]: option },
+      description: `Chooses ${action} with ${name} ${option}.`,
+      fill: null,
+      names: [String(option)],
+    }));
+  }
+  if (field.kind.type === "number" || field.kind.type === "json") {
+    const property = (event.jsonSchema?.properties as Record<string, JsonObject> | undefined)?.[
+      field.name
+    ];
+    return (numericChoices(property) ?? []).map((value) => {
+      const meaning = valueMeaning(field.description, value);
+      return {
+        event: { type: event.type, [field.name]: value },
+        description: `Chooses ${action} with ${name} ${value}${meaning ? ` (${meaning})` : ""}.`,
+        fill: null,
+        names: meaning ? [String(value), meaning] : [String(value)],
+      };
+    });
+  }
+  if (field.kind.type === "string") {
+    return [
+      {
+        event: { type: event.type },
+        description: `Is the ${name} to send with ${action}: the reply's own words.`,
+        fill: field.name,
+        names: [],
+      },
+    ];
+  }
+  return [];
+}
+
+/**
+ * How free chat text reaches an idle machine: `direct` sends it as the text
+ * event (the only thing text can mean here), `interpret` asks Jev which of
+ * several readings it means, and `none` means no event can carry text.
+ */
+export function textRouting(idle: ChatIdle): "direct" | "interpret" | "none" {
+  const candidates = textCandidates(idle.events, idle.choices).length;
+  if (idle.textEvent && candidates <= 1) return "direct";
+  return candidates > 0 ? "interpret" : "none";
+}

@@ -1,0 +1,45 @@
+{
+  "name": "ai-sdk-evaluator-optimizer",
+  "title": "Translate, then critique the translation",
+  "kind": "comparison",
+  "origin": {
+    "type": "docs",
+    "source": "Vercel AI SDK evaluator-optimizer workflow",
+    "url": "https://ai-sdk.dev/docs/agents/workflows#evaluator-optimizer"
+  },
+  "comparison": {
+    "targets": ["Vercel AI SDK", "evaluator-optimizer"],
+    "purpose": "The AI SDK evaluator-optimizer loop with its exit rule in code: Jev grades each draft (a quality score plus tone, nuance, and cultural checks), a choice state passes it only at 8/10 with every aspect held, and a grade budget (maxIterations) bounds the critique-and-revise loop, so a draft that never passes ends labeled as not passing instead of looping or being called approved."
+  },
+  "starters": [
+    {
+      "label": "Proverb into Japanese",
+      "input": {
+        "text": "The early bird catches the worm.",
+        "targetLanguage": "Japanese"
+      }
+    },
+    {
+      "label": "Idiom into French",
+      "input": {
+        "text": "Break a leg out there tonight!",
+        "targetLanguage": "French"
+      }
+    },
+    {
+      "label": "Slogan into Spanish",
+      "input": {
+        "text": "Ship it before the coffee gets cold.",
+        "targetLanguage": "Spanish"
+      }
+    },
+    {
+      "label": "Idiom into German, one grade only (budget stop)",
+      "input": {
+        "text": "It is raining cats and dogs.",
+        "targetLanguage": "German",
+        "maxIterations": 1
+      }
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "name": "deadline-escalation",
+  "title": "Approval with a deadline timer",
+  "kind": "pattern",
+  "origin": {
+    "type": "adapted",
+    "source": "Original XState example inspired by the linked pattern",
+    "url": "https://docs.langchain.com/oss/javascript/langgraph/interrupts"
+  },
+  "comparison": {
+    "targets": ["LangGraph"],
+    "purpose": "An approval wait with an XState `after` deadline. In-process, the loop waits for it; with host-owned timers, the run settles, the host schedules the deadline durably, and delivers it to a resumed run. Approval and expiry race inside the machine, and a stale approval never passes the guard."
+  },
+  "starters": [
+    {
+      "label": "Schedule maintenance — 30s to approve",
+      "input": {
+        "requestId": "proposal-1",
+        "task": "Schedule maintenance",
+        "windowMs": 30000
+      }
+    }
+  ]
+}

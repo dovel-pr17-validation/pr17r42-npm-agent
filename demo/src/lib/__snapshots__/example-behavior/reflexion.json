@@ -1,0 +1,47 @@
+{
+  "How should a small team roll out an AI coding assistant?": [
+    {
+      "sent": "start {\"question\":\"How should a small team roll out an AI coding assistant?\"}",
+      "status": "done",
+      "trace": [
+        "transition @xstate.init -> \"drafting\"",
+        "transition xstate.done.actor -> \"searching\"",
+        "transition xstate.done.actor -> \"revising\"",
+        "transition xstate.done.actor -> \"searching\"",
+        "transition xstate.done.actor -> \"revising\"",
+        "transition xstate.done.actor -> \"done\""
+      ],
+      "response": "mock answer\n\n- Revisions: 2\n\n**Trail**\n\n- Draft — missing: mock missing\n- Next queries: mock searchQueries0\n- Search 1: no passages\n- Revision 1 cites [none] (dropped unretrieved: mock references0) — missing: mock missing\n- Next queries: mock searchQueries0\n- Search 2: no passages\n- Revision 2 cites [none] (dropped unretrieved: mock references0) — missing: mock missing\n- Next queries: mock searchQueries0"
+    }
+  ],
+  "What security and licensing risks come with AI coding assistants?": [
+    {
+      "sent": "start {\"question\":\"What security and licensing risks come with AI coding assistants?\"}",
+      "status": "done",
+      "trace": [
+        "transition @xstate.init -> \"drafting\"",
+        "transition xstate.done.actor -> \"searching\"",
+        "transition xstate.done.actor -> \"revising\"",
+        "transition xstate.done.actor -> \"searching\"",
+        "transition xstate.done.actor -> \"revising\"",
+        "transition xstate.done.actor -> \"done\""
+      ],
+      "response": "mock answer\n\n- Revisions: 2\n\n**Trail**\n\n- Draft — missing: mock missing\n- Next queries: mock searchQueries0\n- Search 1: no passages\n- Revision 1 cites [none] (dropped unretrieved: mock references0) — missing: mock missing\n- Next queries: mock searchQueries0\n- Search 2: no passages\n- Revision 2 cites [none] (dropped unretrieved: mock references0) — missing: mock missing\n- Next queries: mock searchQueries0"
+    }
+  ],
+  "How can a team tell whether an AI coding assistant pays off?": [
+    {
+      "sent": "start {\"question\":\"How can a team tell whether an AI coding assistant pays off?\"}",
+      "status": "done",
+      "trace": [
+        "transition @xstate.init -> \"drafting\"",
+        "transition xstate.done.actor -> \"searching\"",
+        "transition xstate.done.actor -> \"revising\"",
+        "transition xstate.done.actor -> \"searching\"",
+        "transition xstate.done.actor -> \"revising\"",
+        "transition xstate.done.actor -> \"done\""
+      ],
+      "response": "mock answer\n\n- Revisions: 2\n\n**Trail**\n\n- Draft — missing: mock missing\n- Next queries: mock searchQueries0\n- Search 1: no passages\n- Revision 1 cites [none] (dropped unretrieved: mock references0) — missing: mock missing\n- Next queries: mock searchQueries0\n- Search 2: no passages\n- Revision 2 cites [none] (dropped unretrieved: mock references0) — missing: mock missing\n- Next queries: mock searchQueries0"
+    }
+  ]
+}

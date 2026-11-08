@@ -1,0 +1,473 @@
+---
+title: Decisions
+description: Let the model choose one currently-legal machine event, validated and retried by the machine before it is taken.
+---
+
+> **Alpha:** `@statelyai/agent` 2.0 is in alpha. APIs can change between releases; pin an exact version. Feedback: [github.com/statelyai/agent](https://github.com/statelyai/agent/issues).
+
+## Overview
+
+A **decision** lets the model choose one event to send to the running machine. The machine declares the candidate events, guards determine which of them are legal in the current state, and the model picks one of the remaining candidates. The model does not produce free text or an arbitrary tool call. The machine rejects any event that is not legal in the current state.
+
+The snippets below come from [Twenty Questions](https://github.com/statelyai/agent/blob/next/examples/twenty-questions/index.ts), where the model chooses `ASK` or `GUESS` each turn.
+
+<!-- viz: sequence diagram for one decision: machine invokes agent.decide -> host coerces the model to one candidate event -> validation (unknown-event / invalid-payload / rejected-by-guard) -> retry or send the event to the machine -->
+
+## Invoking an agent decision
+
+<!-- agent.decide builtin from src/setup-agent.ts and src/decision.ts -->
+
+Author a decision inline on the invoke that needs one, using the builtin `agent.decide` actor source. Its input takes:
+
+- `model`: which model to use (a key from your models map).
+- `name` (optional): the request's semantic name. It identifies the decision in traces, host mocks, and eval scripts. Without it the name falls back to the invoke `id`, then to the invoke's state path. See [Plain-function executors](evals.md#plain-function-executors).
+- `system` (optional): system prompt.
+- `prompt` (optional): user prompt, usually built from `context`.
+- `allowedEvents` (optional): the candidate events (exact types or [patterns](#allowedevents-patterns)). Defaults to all currently-legal events.
+- `maxRetries` (optional): retries after an invalid choice. Default 2.
+
+```ts no-check
+// ...
+deciding: {
+  invoke: {
+    src: 'agent.decide',
+    input: ({ context }) => ({
+      model: 'quick',
+      name: 'chooseAction',
+      system: 'Ask one yes/no question at a time, but guess on the final turn.',
+      prompt: `Questions remaining: ${context.questionsRemaining}`,
+      allowedEvents: ['ASK', 'GUESS'],
+    }),
+    // Reached when retries are exhausted.
+    onError: { target: 'failed' },
+  },
+  on: {
+    ASK: ({ context, event }) =>
+      context.questionsRemaining > 1 ? { target: 'awaitingAnswer', context: { /* ... */ } } : undefined,
+    GUESS: ({ context, event }) => ({ target: 'revealing', context: { guess: event.guess } }),
+  },
+}
+// ...
+```
+
+The `allowedEvents` list is typed against the machine's user-authored event schema, so a typo is a compile error. Framework events such as `@agent.usage` can be handled by the machine but are never model-facing candidates. Listing events explicitly also makes the candidate set visible in the machine.
+
+> **Note:** `agent.decide` needs a snapshot-aware host such as `runToQuiescence` to know which events are currently legal. With a [long-lived actor](choosing-a-run-mode.md#long-lived-actor), list `allowedEvents` explicitly. Wildcards and the omitted default cannot expand there.
+
+### `allowedEvents` patterns
+
+The `allowedEvents` option accepts a single string or an array. Entries are exact event types or wildcard patterns, and the two can mix, as in `['todo.*', 'reset']`.
+
+| Value              | Meaning                                                                                                                                                                                             |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `['ASK', 'GUESS']` | Exact event types, typed against the event-schema keys. A typo is a compile error.                                                                                                                  |
+| `'ASK'`            | A single string, shorthand for a one-entry array.                                                                                                                                                   |
+| `'*'`              | Every currently-legal event.                                                                                                                                                                        |
+| `'todo.*'`         | Every declared event under the `todo.` namespace, such as `todo.add` and `todo.toggle`. Typed against declared dotted types, so a pattern matching nothing, such as `'nope.*'`, is a compile error. |
+
+### Reusable decision logic
+
+<!-- createDecisionLogic public API from src/decision.ts and src/index.ts -->
+
+For a decision used by more than one state or machine, `createDecisionLogic` builds the same decision as standalone actor logic, exported from `@statelyai/agent`. Register the result under `actors:` and invoke it by name. It takes the same fields as the `agent.decide` input, each a static value or an `({ input }) => value` resolver, plus an optional `schemas.input` to type and validate the input.
+
+```ts no-check
+import { createDecisionLogic } from "@statelyai/agent";
+import { z } from "zod";
+
+export const chooseAction = createDecisionLogic({
+  schemas: { input: z.object({ questionsRemaining: z.number() }) },
+  model: "quick",
+  system: "Ask one yes/no question at a time, but guess on the final turn.",
+  prompt: ({ input }) => `Questions remaining: ${input.questionsRemaining}`,
+  allowedEvents: ["ASK", "GUESS"],
+});
+```
+
+Prefer the `agent.decide` builtin for a one-off, state-local decision: it needs no separate declaration and types `allowedEvents` against the machine's own event schemas.
+
+## Delivering the chosen event
+
+Delivery is automatic. When the decision resolves, the `agent.decide` actor sends the chosen event to the machine, and the matching `on:` transition runs. You handle the outcome with ordinary transitions.
+
+### When `onDone` fires
+
+The chosen event's transition usually exits the invoking state, which cancels the invoke, so `onDone` normally never fires. Declare `onDone` only when the chosen event's transition stays in the same state. The invoke then completes with the chosen event as its output. `onError` is unaffected and still fires when retries are exhausted with `AgentDecisionExhaustedError`.
+
+## Guard enforcement
+
+Guards are transition functions that return `undefined`. See [Transitions](machines.md#transitions). A guard may read the event payload, so candidates cannot be filtered before the model picks.
+
+The candidate set is the `allowedEvents` list intersected with the events the state statically accepts. After the model picks one, `snapshot.can(event)` decides whether it is legal in the current snapshot. A chosen `ASK` on the final turn is rejected, and the model is asked again.
+
+`runToQuiescence` performs this check for you. When you call `resolveDecision` directly with a [long-lived actor](choosing-a-run-mode.md#long-lived-actor), pass the check through `canTake`:
+
+```ts
+import { resolveDecision } from "@statelyai/agent";
+
+const event = await resolveDecision(request, executors, {
+  canTake: (e) => snapshot.can(e),
+});
+```
+
+Build the request with `createDecisionRequest` rather than by hand. It fills in `kind`, an `id`, an empty `attempts` list, and each candidate event's `toolName`, and accepts either bare event types or the descriptors `getAcceptedEvents` returns:
+
+```ts no-check
+const request = createDecisionRequest({
+  name: "judge",
+  model: "reviewer",
+  prompt: `Judge this draft.\n\n${snapshot.context.draft}`,
+  events: getAcceptedEvents(snapshot),
+});
+```
+
+## Events a person sends
+
+Tag a transition with `meta: { actor: "human" }` when only a person may send its event, such as an approval. No model-facing decision offers that event in a state that handles it this way.
+
+```ts no-check
+reviewing: {
+  invoke: {
+    src: "agent.decide",
+    input: { model: "quick", allowedEvents: ["revise"] },
+  },
+  on: {
+    approve: { target: "approved", meta: { actor: "human" } },
+    revise: { target: "revising" },
+  },
+},
+```
+
+- `agent.decide` and `decideNext` drop the event from the candidates. A closed choice lists its options in `withheld`, and a choice of it anyway is retried.
+- `getAcceptedEvents(snapshot, { actor: "agent" })` returns the same model-facing list, for a host that offers events itself.
+- `describeMachine` marks the transition `(human)`.
+- `lintAgentMachine` reports `decide-allows-human-event` when a decision's literal `allowedEvents` names a tagged event. `verifyAgentConfig` fails its `lint` gate on it.
+- Only object transitions can be tagged. A transition written as a function has no static `meta`.
+- A plain `createMachine` declares `schemas: { meta: interactionMetaSchema }` to type the tag; `setupAgent` machines have it by default.
+
+The tag does not change what the machine accepts. A host still sends the event when a person answers, and `parseAgentEvent` still parses it.
+
+## Validation and retries
+
+<!-- decision validation checks and retry behavior from src/decision.ts -->
+
+Each attempt runs three checks in order. Each failure is typed and fed back to the model on the next attempt:
+
+| Failure             | Cause                                                                                                                                                  |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `unknown-event`     | The event type is not among the candidate events.                                                                                                      |
+| `invalid-payload`   | The payload does not match that event's schema.                                                                                                        |
+| `rejected-by-guard` | The type and payload are valid, but `snapshot.can(event)` returned `false`, or the event matches none of a [closed choice](#closed-choices)'s options. |
+
+Retry behavior:
+
+- The default is 2 retries, so up to 3 attempts. Set `maxRetries` on the decide input to change it.
+- Prior failed attempts are carried on `request.attempts`, so the host can render the previous failure into the next call. Core does not rewrite the prompt itself. See [Hosts](hosts.md).
+- Exhausting retries throws `AgentDecisionExhaustedError`, which carries the attempts list and is caught by the invoke's `onError`.
+- The run's [event log](event-log.md) keeps the failed attempts on the entry they explain. `getDecisionAttempts` reads them back. See [Decision attempts](event-log.md#decision-attempts).
+
+## Coercion
+
+Core validates and retries. It never calls a model. Coercing the model into choosing exactly one option is the host's responsibility. The shipped AI SDK, OpenAI, and TanStack AI executors offer two modes, set by the `decideMode` option on each adapter:
+
+- `'object'` (default for object payloads): one structured-output call. An open choice answers `{ event }`, where `event` is one candidate event, `type` included. Root unions of object payloads become separate event variants. A closed choice answers `{ choice }`, an enum of option ids. The answer holds one event by construction.
+- `'tool'`: one tool per candidate event under a forced tool choice. Parallel tool calls are turned off where the provider allows it, and an answer that still calls more than one tool is rejected.
+- A function of the request picks the mode per request. Returning `undefined` uses the default: `'object'` when every payload can be represented as object variants, otherwise `'tool'`. This avoids unsupported `allOf` schemas in strict structured-output providers.
+
+```ts no-check
+createAiSdkExecutors({ models, decideMode: "tool" });
+createOpenAiExecutors({ client, decideMode: (request) => (request.options ? "object" : "tool") });
+```
+
+An executor returns an answer it cannot read as an event as `rejected: { failure, reason }` instead of `event`. Core records it as a failed attempt, feeds `reason` back to the model as written, and asks again. The shipped executors reject:
+
+- An object answer that is not valid JSON: an `invalid-payload` attempt.
+- An object answer that names no event, or an event that is not a candidate: an `unknown-event` attempt whose reason lists the valid events.
+- A closed-choice id that was not offered: an `unknown-event` attempt whose reason lists the valid ids.
+- In tool mode, no tool call, a call to a tool that was not offered, or more than one call: an `unknown-event` attempt whose reason lists the tools to call.
+- In tool mode, tool arguments that are not valid JSON: an `invalid-payload` attempt whose reason names the tool.
+
+Decision models such as Jev are not affected by `decideMode`. See [Decision models](#decision-models).
+
+> **Note:** Decisions are state-local, so prefer authoring one-off decisions inline on the invoke.
+
+## The decide loop for multi-event commands
+
+A decision produces one event. When one command needs several events, such as "add X and Y" producing two `ADD_TODO` events, loop the decision in the machine. The loop, its exit, and the trail of applied events stay visible in the statechart.
+
+- A `planning` state invokes `agent.decide` for one event.
+- Applying that event targets a turnaround state that immediately re-enters `planning` and starts the next step.
+- An explicit machine event, such as `DONE`, is among `allowedEvents` and targets a state outside the loop, so the model can end the loop.
+- The trail of applied events lives in context and is appended to each step's prompt.
+
+<!-- viz: state diagram of the decide loop: planning (invoke agent.decide) -> applying (always -> planning) for ADD_TODO/TOGGLE_TODO, and DONE -> awaitingCommand -->
+
+```ts no-check
+planning: {
+  invoke: {
+    src: 'agent.decide',
+    input: ({ context }) => ({
+      model: 'quick',
+      prompt: `${context.command}\n\nAlready applied: ${context.applied.join(', ')}`,
+      allowedEvents: ['ADD_TODO', 'TOGGLE_TODO', 'DONE'],
+    }),
+  },
+  on: {
+    ADD_TODO: ({ context, event }) => ({
+      target: 'applying',
+      context: { applied: [...context.applied, `ADD_TODO ${event.title}`] },
+    }),
+    DONE: { target: 'awaitingCommand' },
+  },
+},
+applying: { always: { target: 'planning' } },
+```
+
+Every step runs the validation and retry loop described above. For the full example, see [examples/todo-nl/index.ts](https://github.com/statelyai/agent/blob/next/examples/todo-nl/index.ts).
+
+To let the model send several events in one tool loop instead, invoke `agent.act`. See [Acting on events](act.md).
+
+## Closed choices
+
+By default the model writes the event payload. A **closed choice** lists the concrete events instead, and the model picks one.
+
+- Pass `payloads` on the `agent.decide` input: one payload list per event type, without `type`.
+- Each payload becomes one option on `request.options`.
+- An event type in `allowedEvents` with no `payloads` key is offered bare, as `{ type }`. An empty list offers nothing for that type. To withhold a type, give it `[]`: `payloads: { refund: [{ amount: 20 }], escalate: [] }`.
+- The runtime keeps only the options `snapshot.can(event)` accepts right now.
+- The chosen event must equal one offered option, type and payload. Any other choice is retried as a `rejected-by-guard` attempt.
+- When the snapshot accepts none of the options, the decision fails at once with `AgentDecisionExhaustedError` and no model call. Handle it with the invoke's `onError`.
+
+```ts
+import { createAgentSchemas, setupAgent } from "@statelyai/agent";
+import { z } from "zod";
+
+const agent = setupAgent({
+  schemas: createAgentSchemas({
+    context: z.object({ limit: z.number() }),
+    events: { refund: z.object({ amount: z.number() }), escalate: z.object({}) },
+  }),
+});
+
+agent.createMachine({
+  context: { limit: 50 },
+  initial: "deciding",
+  states: {
+    deciding: {
+      invoke: {
+        src: "agent.decide",
+        input: {
+          model: "quick",
+          allowedEvents: ["refund", "escalate"],
+          // The model sees refund 20 and escalate. The machine does not accept refund 80.
+          payloads: { refund: [{ amount: 20 }, { amount: 80 }] },
+        },
+      },
+      on: {
+        refund: ({ context, event }) =>
+          event.amount <= context.limit ? { target: "refunded" } : undefined,
+        escalate: { target: "escalated" },
+      },
+    },
+    refunded: {},
+    escalated: {},
+  },
+});
+```
+
+### Closed choices in the shipped adapters
+
+- In object mode, the answer is `{ choice }`, an enum of option ids such as `refund:20` and `escalate`. The schema description lists each id with its description.
+- In tool mode, `createAiSdkExecutors` presents a closed choice as ONE tool, `choose_option`, whose input is `{ option }` over the same ids.
+- The chosen id maps back to that option's event.
+- An id that is not offered, or a call to another tool, is retried as an `unknown-event` attempt. Its reason names the answer and lists the valid ids.
+
+### Decision models
+
+An AI SDK decision model, such as TypeSafe's Jev, goes in the same `createAiSdkExecutors` models map as the language models. A decide request whose model ref names it is answered through `experimental_decide`.
+
+- The request must be a closed choice: `payloads` on `agent.decide`, `decideNext`, or the pick step of a [decision strategy](#decision-strategies). A request without options throws.
+- It asks one `choice` question. Each option id is a label, and its criterion is the option's description, or the event as JSON when it has none.
+- A label that is not an option is retried as an `unknown-event` attempt, like any failed choice.
+- The result carries `confidence` when the model reports it. Branch on it in your own code.
+
+```ts
+import { createAiSdkExecutors } from "@statelyai/agent/ai-sdk";
+import { openai } from "@ai-sdk/openai";
+import { typeSafeAi } from "@ai-sdk/typesafe-ai";
+
+const { decide } = createAiSdkExecutors({
+  models: { desk: openai("gpt-6-luna"), judge: typeSafeAi.decisionModel("jev-latest") },
+});
+```
+
+See [Decision models](models-and-providers.md#decision-models).
+
+## Decision strategies
+
+A **decision strategy** splits one decision into several model calls. Set `strategy` on the `agent.decide` input (or on `createDecisionLogic`). Core runs the strategy around the `decide` executor, so validation and retries apply to the combined answer, and any adapter works.
+
+| Strategy           | Model calls                                                                                                              |
+| ------------------ | ------------------------------------------------------------------------------------------------------------------------ |
+| `'direct'`         | One decide call over every candidate event.                                                                              |
+| `'pick-then-fill'` | Pick the event type as a closed choice over bare `{ type }` options, then fill its payload.                              |
+| `'grouped'`        | Pick a group of event types as a closed choice, then one decide call within that group.                                  |
+| `'auto'` (default) | `'pick-then-fill'` when `fillModel` is set; `'grouped'` over more than 24 events in two or more groups; else `'direct'`. |
+
+Filling a payload under `'pick-then-fill'`:
+
+- An event with no payload fields: no fill call.
+- Every payload field finite (an `enum`, a `const`, a boolean, or a union of those), with at most 32 combinations (`MAX_FINITE_PAYLOADS`): a closed choice over the enumerated payloads, on the same model.
+- Any open field: a structured `generateText` call on `fillModel`, with the event's payload schema as its output schema and `type` fixed. This needs a `generateText` executor.
+- Open fields with no `fillModel` throw `missing-fill-model` at runtime. `verifyAgentConfig` reports it at setup when `strategy: 'pick-then-fill'` is literal.
+
+Groups under `'grouped'`:
+
+- `groups` maps a group name to its event types: `groups: { cart: ["cart.add", "cart.clear"] }`.
+- An event type in no group is grouped by its prefix before the first `.`. `cart.add` and `cart.clear` group as `cart`.
+- Each group option's description lists its member types. A request with fewer than two groups makes one direct call.
+
+Every sub-call counts against the model-call budget, emits its own trace events, and receives the decision's prior `attempts`. Its `info.callKey` adds the role to the attempt key: `<key>.<attempt>.pick`, `.group`, or `.fill`. See [Idempotency keys](hosts.md#idempotency-keys).
+
+```ts
+import { createAgentSchemas, setupAgent } from "@statelyai/agent";
+import { z } from "zod";
+
+const agent = setupAgent({
+  schemas: createAgentSchemas({
+    context: z.object({}),
+    events: {
+      refund: z.object({ amount: z.number(), reason: z.string() }),
+      escalate: z.object({ queue: z.enum(["billing", "tech"]) }),
+    },
+  }),
+});
+
+agent.createMachine({
+  context: {},
+  initial: "triaging",
+  states: {
+    triaging: {
+      invoke: {
+        src: "agent.decide",
+        input: {
+          model: "judge",
+          fillModel: "writer",
+          allowedEvents: ["refund", "escalate"],
+        },
+      },
+      on: { refund: { target: "refunded" }, escalate: { target: "escalated" } },
+    },
+    refunded: {},
+    escalated: {},
+  },
+});
+```
+
+`fillModel` is set, so `'auto'` resolves to `'pick-then-fill'`. `judge` picks `refund` or `escalate`. `escalate` has one finite field, so `judge` also picks its `queue`. `refund` has open fields, so `writer` writes `amount` and `reason`.
+
+### Decision models with `fillModel`
+
+A decision model such as Jev answers only closed choices. `'pick-then-fill'` turns an open choice into closed ones, so a decision model can pick the event type while `fillModel` names a language model that writes the open payload. In the example above, `judge` can be `typeSafeAi.decisionModel("jev-latest")` and `writer` a language model in the same models map.
+
+## A policy as the decider
+
+A decision can be answered by another machine: a policy that applies a rule when the facts are enough and asks a model only for the rest. `createPolicyDecider` turns a policy machine into a decide executor.
+
+```ts no-check
+import { createPolicyDecider, runAgent } from "@statelyai/agent";
+
+const decide = createPolicyDecider(policyMachine, { executors: modelExecutors });
+
+await runAgent(deskMachine, { input, executors: { ...modelExecutors, decide } });
+```
+
+- Each decision request starts one run of the policy. Its output, an event, is the choice. The environment still judges it: an event it does not accept is retried like any decider's.
+- The policy's input defaults to `{ facts, options, system, prompt }`: the request's `metadata.facts`, the offered events, and its prompt. The policy's input schema validates it. Pass `input: (request) => ...` to build it another way.
+- The policy's own `agent.decide` invokes are answered by `executors`. Pass the environment's `metadata` on to them, so the model sees what it would without the policy.
+- The result carries the policy's token usage, and none when it decided with a rule.
+- A run that does not end `done` with an event throws `AgentError` with code `policy-not-done`. Give each of the policy's decisions an `onError` that falls back to an event the environment always accepts.
+- Every other `runAgent` option passes through: `store` and `metadata` to journal the policy's runs, `onTrace` to trace them.
+- Each decision's policy run gets its own `store` thread, `policy:${info.callKey}:${hash}` by default, where `hash` is the SHA-256 of the policy input: a thread that already has entries is resumed, so a shared one would return an earlier choice. The hash keeps a machine that asks something else at the same call site after a version bridge, which keeps the call key, off the earlier thread. Pass `threadId: (request, info) => ...` to name them yourself; it is required with a `store` when the decider is called without a `callKey`.
+- The policy's input must be JSON, since it opens the run's event log. The default drops keys whose value is `undefined`; any other value that is not JSON throws before the run.
+
+To route by request name, wrap it: `decide: (request, info) => (request.name === "chooseResolution" ? policyDecide(request, info) : modelExecutors.decide!(request, info))`, where `policyDecide` is the executor `createPolicyDecider` returned.
+
+## Decisions at the boundary of a plain machine
+
+A machine does not have to know about AI. `decideNext` asks a model to pick one event that a plain XState machine accepts right now, built with `createMachine` or `setup`, with no `agent.*` invoke anywhere.
+
+- `allowedEvents`: exact types or wildcards such as `'desk.*'`. Candidates are the matching events an active state handles.
+- `payloads` (optional): a function of the snapshot returning payloads per event type, as in a closed choice. A candidate type with no key is offered bare, as `{ type }`. An empty list offers nothing for that type, so `{ "desk.escalate": [] }` withholds it.
+- Options are kept only where `snapshot.can(event)` is true. Each one is described by its transition's `description`, else its event schema's description.
+- `lookahead` (optional): appends what each option changes, computed with xstate's pure `transition()`: the state value and the changed top-level context keys.
+  - `true` reports every changed key.
+  - An array of context keys reports only those keys. A state value change is always reported.
+  - Each reported value is cut at 120 characters.
+- With no options, it returns `{ event: null }` without calling the executor.
+- It never sends. The host sends the event, after checking `can` again, because the actor may have moved while the model was choosing.
+
+```ts
+import { decideNext } from "@statelyai/agent";
+import { createAiSdkExecutors } from "@statelyai/agent/ai-sdk";
+import { openai } from "@ai-sdk/openai";
+import { createActor, createMachine } from "xstate";
+import { z } from "zod";
+
+const desk = createMachine({
+  schemas: {
+    context: z.object({ requested: z.number(), limit: z.number() }),
+    events: {
+      "desk.refund": z.object({ amount: z.number() }),
+      "desk.escalate": z.object({}).describe("Hand the case to a person"),
+    },
+  },
+  context: { requested: 20, limit: 50 },
+  initial: "reviewing",
+  states: {
+    reviewing: {
+      on: {
+        "desk.refund": {
+          description: "Refund the customer",
+          to: ({ context, event }) =>
+            event.amount <= context.limit ? { target: "refunded" } : undefined,
+        },
+        "desk.escalate": { target: "escalated" },
+      },
+    },
+    refunded: {},
+    escalated: {},
+  },
+});
+
+const { decide } = createAiSdkExecutors({ models: { quick: openai("gpt-6-luna") } });
+const actor = createActor(desk);
+
+let busy = false;
+actor.subscribe(async (snapshot) => {
+  if (busy || !snapshot.matches("reviewing")) return;
+  busy = true;
+  try {
+    const { event } = await decideNext(snapshot, {
+      decide,
+      model: "quick",
+      allowedEvents: "desk.*",
+      payloads: (s) => ({ "desk.refund": [{ amount: s.context.requested }] }),
+      lookahead: true,
+    });
+    if (event && actor.getSnapshot().can(event)) actor.send(event);
+  } finally {
+    busy = false;
+  }
+});
+actor.start();
+```
+
+The result also carries `attempts`, the failed choices before the one that landed, and the `request` the executor saw. `withheld` lists the candidates the snapshot rejected: each `allowedEvents` type and payload, built like the options, where `snapshot.can(event)` was false. The model never sees them; `request.withheld` holds the same list. A closed choice under the runtime sets `request.withheld` the same way, and traces it even when every option is withheld and no model call is made. Exhausting retries throws `AgentDecisionExhaustedError`. To journal `attempts`, pass them with the event to the run that delivers it. See [Boundary decisions](event-log.md#boundary-decisions).
+
+## Related
+
+- Read more about [Agent machines](machines.md), including transitions, guards, and event schemas.
+- Read more about [Acting on events](act.md), for several events in one tool loop.
+- Read more about [Hosts](hosts.md), including the decide executor and how the model is coerced into one event.
+- Read more about [Machines as data](machines-as-data.md), including authoring decisions from JSON.

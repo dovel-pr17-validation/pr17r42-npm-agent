@@ -1,0 +1,568 @@
+/**
+ * Scenario runner — the real host layer around `runAgent`.
+ *
+ * This is the "TanStack Start host" pattern (examples/tanstack-start-host) for
+ * real: each scenario is a `setupAgent` machine that `runAgent` drives to a
+ * settled result. The host stays stateless — an idle run returns a persisted
+ * snapshot the client sends back to resume.
+ *
+ * Runs need a real model and Jev: `createAiSdkExecutors` with `OPENAI_API_KEY`
+ * for text requests and decisions, and `TYPESAFE_AI_API_KEY` for the judgments
+ * (routing, reflection's scoring, the free-text review), which call the AI
+ * SDK's `experimental_decide` with Jev (`@ai-sdk/typesafe-ai`) as the
+ * decision model. Tests import the `*Run` functions directly and inject
+ * their own executors and a mock decision model as the `judge`.
+ */
+import {
+  createAgentRuntime,
+  runToQuiescence,
+  type AgentRequestExecutors,
+  type AgentRunResult,
+} from "@statelyai/agent";
+import { experimental_decide, type Experimental_DecisionModel } from "ai";
+import { typeSafeAi } from "@ai-sdk/typesafe-ai";
+import {
+  createActor,
+  createAsyncLogic,
+  toPromise,
+  type AnyActorLogic,
+  type AnyMachineSnapshot,
+  type AnyStateMachine,
+  type Snapshot,
+} from "xstate";
+import { maybeCreateRunInspection } from "./inspection.server";
+import { interpretIdleText, unclearTextReply } from "./interpret-text.server";
+import {
+  createTraceRecorder,
+  describeIdle,
+  ignoredEventNote,
+  missingApiKeys,
+  type RunLimits,
+  type TraceEntry,
+} from "./machine-chat.server";
+import { missingKeyMessage, type ChatIdle } from "./machine-ui";
+import { refundMachine } from "@/agents/refund";
+import { approvalMachine } from "@/agents/approval";
+import { createClassifyIntent, routingMachine } from "@/agents/routing";
+import { researchMachine } from "@/agents/research";
+import { pipelineMachine } from "@/agents/pipeline";
+import { retryMachine } from "@/agents/retry";
+import { toolsMachine } from "@/agents/tools";
+import { createEvaluate, reflectionMachine } from "@/agents/reflection";
+import { createEvaluatePrompt, emailDrafterV1Machine } from "@/agents/email-drafter-v1";
+import { emailDrafterV2Machine } from "@/agents/email-drafter-v2";
+import { scenarioSource, type ScenarioId } from "./scenarios";
+
+/** JSON-safe value — server fns must return serializable data (TanStack validates it). */
+type Json = string | number | boolean | null | Json[] | { [key: string]: Json };
+
+export type { TraceEntry };
+
+export type IdlePayload = ChatIdle & {
+  /** JSON-serializable persisted snapshot; the client sends it back to resume. */
+  snapshot: Json;
+};
+
+export type ScenarioResult = {
+  model?: string;
+  status: "done" | "idle" | "error";
+  trace: TraceEntry[];
+  response: string;
+  idle?: IdlePayload;
+  output?: Json;
+  /**
+   * Set when the resumed state had no transition for the delivered event.
+   * `runAgent` ignores it (see docs/persistence.md) — the run settles
+   * unchanged, and the UI says nothing happened.
+   */
+  ignored?: { type: string };
+};
+
+export type ResumeEvent =
+  | { type: string; [key: string]: unknown }
+  | { kind: "interpret"; text: string };
+
+/** What a streamed run watches as it goes, and the inspection room it lands in. */
+export type RunObservers = Pick<RunLimits, "onChunk" | "onStep" | "inspectionRoom">;
+
+/** The index signature on the typed-event variant defeats `in` narrowing, so guard explicitly. */
+function isInterpretEvent(event: ResumeEvent): event is { kind: "interpret"; text: string } {
+  return "kind" in event && (event as { kind?: unknown }).kind === "interpret";
+}
+
+const machines: Record<ScenarioId, AnyStateMachine> = {
+  refund: refundMachine,
+  approval: approvalMachine,
+  routing: routingMachine,
+  research: researchMachine,
+  pipeline: pipelineMachine,
+  retry: retryMachine,
+  tools: toolsMachine,
+  reflection: reflectionMachine,
+  "email-drafter-v1": emailDrafterV1Machine,
+  "email-drafter-v2": emailDrafterV2Machine,
+};
+
+export function machineFor(scenarioId: ScenarioId): AnyStateMachine {
+  return machines[scenarioId];
+}
+
+/** Builds each machine's `input` from the single prompt string. */
+function inputFor(scenarioId: ScenarioId, prompt: string): Record<string, string> {
+  switch (scenarioId) {
+    case "refund":
+      return { request: prompt };
+    case "approval":
+    case "research":
+    case "reflection":
+      return { topic: prompt };
+    case "routing":
+      return { query: prompt };
+    case "pipeline":
+      return { task: prompt };
+    case "retry":
+      return { ticket: prompt };
+    case "tools":
+      return { question: prompt };
+    case "email-drafter-v1":
+    case "email-drafter-v2":
+      return { prompt };
+  }
+}
+
+// ─── executor resolution ───
+
+/** Resolves AI SDK executors for a scenario, plus the model label. Throws without a key. */
+async function resolveExecutors(
+  scenarioId: ScenarioId,
+): Promise<{ model: string; executors: Partial<AgentRequestExecutors> }> {
+  const missing = missingApiKeys();
+  if (missing.length) throw new Error(missingKeyMessage(missing));
+  // Lazy import: keeps @ai-sdk/openai out of the client bundle.
+  const [{ createAiSdkExecutors }, { openai }] = await Promise.all([
+    import("@statelyai/agent/ai-sdk"),
+    import("@ai-sdk/openai"),
+  ]);
+  const primary = process.env.OPENAI_MODEL || "gpt-6-luna";
+  const fallback = process.env.OPENAI_FALLBACK_MODEL || primary;
+  const models = {
+    fast: openai(primary),
+    writer: openai(primary),
+    analyst: openai(primary),
+    planner: openai(primary),
+    critic: openai(primary),
+    reasoner: openai(primary),
+    primary: openai(primary),
+    fallback: openai(fallback),
+  };
+  const executors = createAiSdkExecutors({ models });
+  // Deterministic outage demo for the retry scenario: a healthy primary never
+  // fails live, so the advertised retry path would never show. Two markers, two
+  // shapes of recovery:
+  //   `[primary-outage]`      — the FIRST primary attempt throws, the retry
+  //                             succeeds on the primary model.
+  //   `[primary-outage-hard]` — EVERY primary attempt throws, so the retry
+  //                             budget is spent and the fallback model answers.
+  //   `[all-models-down]`     — the fallback throws too, so the run ends in
+  //                             its `failed` state.
+  // The counter is per-run: `resolveExecutors` is called once per start/resume.
+  if (scenarioId === "retry") {
+    const inner = executors.generateText;
+    if (inner) {
+      let primaryAttempts = 0;
+      executors.generateText = (request, ...rest) => {
+        if ((request.prompt ?? "").includes("[all-models-down]")) {
+          throw new Error(`Simulated ${request.model} model outage`);
+        }
+        if (request.model === "primary") {
+          const prompt = request.prompt ?? "";
+          primaryAttempts += 1;
+          const hard = prompt.includes("[primary-outage-hard]");
+          const soft = prompt.includes("[primary-outage]");
+          if (hard || (soft && primaryAttempts === 1)) {
+            throw new Error("Simulated primary model outage");
+          }
+        }
+        return inner(request, ...rest);
+      };
+    }
+  }
+  return { model: primary, executors };
+}
+
+/**
+ * The scenario's judgment actors bound to an injected judge model. Without
+ * one, each machine's registered default uses Jev, which reads
+ * `TYPESAFE_AI_API_KEY`.
+ */
+function judgeActors(
+  scenarioId: ScenarioId,
+  judge: Experimental_DecisionModel | undefined,
+): { actors?: Record<string, AnyActorLogic> } {
+  if (!judge) return {};
+  if (scenarioId === "routing") return { actors: { classifyIntent: createClassifyIntent(judge) } };
+  if (scenarioId === "reflection") return { actors: { evaluate: createEvaluate(judge) } };
+  if (scenarioId === "email-drafter-v1")
+    return { actors: { evaluatePrompt: createEvaluatePrompt(judge) } };
+  return {};
+}
+
+// ─── result shaping ───
+
+function describeResult(scenarioId: ScenarioId, result: AgentRunResult<AnyStateMachine>): string {
+  if (result.ignored) return ignoredEventNote(result.snapshot, result.ignored);
+  if (result.status === "done") {
+    const output = result.output as Record<string, unknown>;
+    switch (scenarioId) {
+      case "refund": {
+        const amount = output.amount == null ? "" : ` ($${Number(output.amount).toFixed(2)})`;
+        return `Outcome: ${output.outcome}${amount}.`;
+      }
+      case "approval":
+        return output.published ? `Published:\n${output.draft}` : `Not published:\n${output.draft}`;
+      case "routing":
+        return `Routed to the ${output.queue} queue: ${output.reason ?? "no reason given"}`;
+      case "research":
+        return String(output.synthesis || "Synthesis complete.");
+      case "pipeline":
+        if (output.failedAt) return `Failed at ${output.failedAt}.`;
+        return output.verified === false
+          ? `Withheld: the check did not pass, so this draft never reached complete.\n\n${output.verification}\n\n${output.draft}`
+          : `${output.draft}\n\nVerification: ${output.verification}`;
+      case "retry":
+        return output.category
+          ? `${output.category}\n\n${output.outcome} (${output.attempts} retr${output.attempts === 1 ? "y" : "ies"})`
+          : String(output.outcome || "All model attempts failed.");
+      case "tools":
+        return `${output.answer} (in ${output.steps} tool step${output.steps === 1 ? "" : "s"})`;
+      case "reflection":
+        // A draft that cleared the bar first time has no before/after.
+        return output.firstDraft === output.draft
+          ? `${output.draft}\n\n${output.verdict}`
+          : `**First draft**\n\n${output.firstDraft}\n\n**Final draft**\n\n${output.draft}\n\n${output.verdict}`;
+      case "email-drafter-v1":
+      case "email-drafter-v2":
+        return describeEmailOutcome(output);
+    }
+  }
+  if (result.status === "idle") {
+    const context = result.snapshot.context as Record<string, unknown>;
+    if (scenarioId === "approval") return String(context.draft ?? "Draft ready for review.");
+    if (scenarioId === "refund") {
+      if (result.snapshot.value === "askingAmount") {
+        return "No amount in the request. Asking the customer how much was charged.";
+      }
+      // The model can also send a refund under the limit to review.
+      return Number(context.amount) > 100
+        ? "Amount exceeds the auto-refund limit. Awaiting approval."
+        : "The model flagged this refund for review. Awaiting approval.";
+    }
+    if (scenarioId === "email-drafter-v1" || scenarioId === "email-drafter-v2") {
+      const draft = context.draft as { to: string; subject: string; body: string } | null;
+      // v1 asks its clarifications before drafting, so by the draft they are
+      // answered; v2 drafts first and lists what it still wants to know.
+      return draft
+        ? formatDraft(
+            draft,
+            scenarioId === "email-drafter-v2"
+              ? (context.clarifications as string[] | undefined)
+              : undefined,
+          )
+        : "Some details are missing.";
+    }
+    return "Waiting for input.";
+  }
+  return "The run ended with an error.";
+}
+
+function formatDraft(
+  draft: { to: string; subject: string; body: string },
+  clarifications: string[] = [],
+): string {
+  const text = `**To:** ${draft.to || "(no recipient yet)"}\n**Subject:** ${draft.subject || "(no subject yet)"}\n\n${draft.body}`;
+  if (!clarifications.length) return text;
+  return `${text}\n\n**Open questions**\n${clarifications.map((question) => `- ${question}`).join("\n")}`;
+}
+
+function describeEmailOutcome(output: Record<string, unknown>): string {
+  if (output.failure) return `Not sent: ${String(output.failure)}`;
+  const sent =
+    (output.sentEmails as { to: string; subject: string; body: string }[] | undefined) ?? [];
+  // Open questions belong with a draft the human can still act on. Once the
+  // email is out, listing what it drafted around only reads as regret.
+  return sent.length ? `Sent (simulated outbox).\n\n${formatDraft(sent[0]!)}` : "Nothing was sent.";
+}
+
+function toResult(
+  scenarioId: ScenarioId,
+  model: string | undefined,
+  result: AgentRunResult<AnyStateMachine>,
+  trace: TraceEntry[],
+): ScenarioResult {
+  const base: ScenarioResult = {
+    model,
+    status: result.status === "done" ? "done" : result.status === "idle" ? "idle" : "error",
+    trace,
+    response: describeResult(scenarioId, result),
+  };
+  if (result.ignored) base.ignored = { type: result.ignored.type };
+  if (result.status === "done") base.output = result.output as Json;
+  if (result.status === "idle") {
+    base.idle = {
+      ...describeIdle(machineFor(scenarioId), result.snapshot),
+      snapshot: result.persist() as unknown as Json,
+    };
+  }
+  return base;
+}
+
+// ─── start / resume ───
+
+/** Runs a scenario from a prompt with the given executors. Pure — used by tests. */
+export async function startScenarioRun(
+  scenarioId: ScenarioId,
+  prompt: string,
+  model: string | undefined,
+  executors: Partial<AgentRequestExecutors>,
+  signal?: AbortSignal,
+  judge?: Experimental_DecisionModel,
+  observers: RunObservers = {},
+): Promise<ScenarioResult> {
+  const { trace, onTransition, onEmitted, onTrace } = createTraceRecorder(
+    undefined,
+    observers.onStep,
+  );
+  const machine = machineFor(scenarioId);
+  const result = await runToQuiescence(
+    createAgentRuntime(machine, {
+      executors,
+      ...judgeActors(scenarioId, judge),
+      ...(signal ? { signal } : {}),
+      ...(observers.onChunk ? { onChunk: observers.onChunk } : {}),
+      onTransition,
+      on: { "*": onEmitted },
+      onTrace,
+      inspect: maybeCreateRunInspection(
+        observers.inspectionRoom,
+        machine,
+        scenarioSource[scenarioId],
+        "start",
+      ),
+    }),
+    {
+      input: inputFor(scenarioId, prompt),
+      ...judgeActors(scenarioId, judge),
+    },
+  );
+  return toResult(scenarioId, model, result as AgentRunResult<AnyStateMachine>, trace);
+}
+
+/** Resumes a persisted idle snapshot with a typed event. Pure — used by tests. */
+export async function resumeScenarioRun(
+  scenarioId: ScenarioId,
+  snapshot: Snapshot<unknown>,
+  event: { type: string; [key: string]: unknown },
+  model: string | undefined,
+  executors: Partial<AgentRequestExecutors>,
+  signal?: AbortSignal,
+  judge?: Experimental_DecisionModel,
+  observers: RunObservers = {},
+): Promise<ScenarioResult> {
+  const { trace, onTransition, onEmitted, onTrace } = createTraceRecorder(
+    undefined,
+    observers.onStep,
+  );
+  const machine = machineFor(scenarioId);
+  // An event the restored state has no transition for is ignored, not an
+  // error: the run settles unchanged and reports `result.ignored`.
+  const result = await runToQuiescence(
+    createAgentRuntime(machine, {
+      executors,
+      ...judgeActors(scenarioId, judge),
+      ...(signal ? { signal } : {}),
+      ...(observers.onChunk ? { onChunk: observers.onChunk } : {}),
+      onTransition,
+      on: { "*": onEmitted },
+      onTrace,
+      inspect: maybeCreateRunInspection(
+        observers.inspectionRoom,
+        machine,
+        scenarioSource[scenarioId],
+        "resume",
+      ),
+    }),
+    {
+      snapshot,
+      event,
+      ...judgeActors(scenarioId, judge),
+    },
+  );
+  return toResult(scenarioId, model, result as AgentRunResult<AnyStateMachine>, trace);
+}
+
+// ─── env-resolving wrappers (used by the server functions) ───
+
+export async function startScenario(
+  scenarioId: ScenarioId,
+  prompt: string,
+  signal?: AbortSignal,
+  observers?: RunObservers,
+): Promise<ScenarioResult> {
+  const { model, executors } = await resolveExecutors(scenarioId);
+  return startScenarioRun(scenarioId, prompt, model, executors, signal, undefined, observers);
+}
+
+export async function resumeScenario(
+  scenarioId: ScenarioId,
+  snapshot: Snapshot<unknown>,
+  event: ResumeEvent,
+  signal?: AbortSignal,
+  /** Injected by tests; omitted, Jev reads `TYPESAFE_AI_API_KEY`. */
+  judge?: Experimental_DecisionModel,
+  observers?: RunObservers,
+): Promise<ScenarioResult> {
+  const { model, executors } = await resolveExecutors(scenarioId);
+
+  // Free text on any other scenario: Jev reads it as one of the offered
+  // events (the state's text event among them), as example runs do.
+  if (isInterpretEvent(event) && scenarioId !== "approval") {
+    const machine = machineFor(scenarioId);
+    const idle = describeIdle(
+      machine,
+      machine.resolveState(
+        snapshot as never as Parameters<AnyStateMachine["resolveState"]>[0],
+      ) as AnyMachineSnapshot,
+    );
+    const chosen = await interpretIdleText(event.text, idle, { signal, judge });
+    if (!chosen) {
+      return {
+        model,
+        status: "idle",
+        trace: [],
+        response: unclearTextReply(idle),
+        idle: { ...idle, snapshot: snapshot as unknown as Json },
+      };
+    }
+    return resumeScenarioRun(
+      scenarioId,
+      snapshot,
+      chosen,
+      model,
+      executors,
+      signal,
+      judge,
+      observers,
+    );
+  }
+
+  // Free-text review ("looks good") → map to a typed event before delivering.
+  if (isInterpretEvent(event)) {
+    const verdict = await interpretReview(event.text, judge);
+    if (verdict === "UNCLEAR") {
+      // Re-settle idle without delivering an event: still awaiting a clear verdict.
+      return startResumeIdleEcho(scenarioId, snapshot, model);
+    }
+    const typed =
+      verdict === "REJECT" ? { type: "REJECT", reason: event.text } : { type: "APPROVE" };
+    return resumeScenarioRun(
+      scenarioId,
+      snapshot,
+      typed,
+      model,
+      executors,
+      signal,
+      judge,
+      observers,
+    );
+  }
+
+  return resumeScenarioRun(scenarioId, snapshot, event, model, executors, signal, judge, observers);
+}
+
+/** Below this confidence, a review reads as unclear and the run asks again. */
+export const REVIEW_CONFIDENCE = 0.6;
+
+/** The judge: Jev through the AI SDK. Reads `TYPESAFE_AI_API_KEY`; tests inject a mock. */
+const judgeModel: Experimental_DecisionModel = typeSafeAi.decisionModel("jev-latest");
+
+/**
+ * Reading a review as approve / reject is a typed judgment over the person's
+ * words, so it is one Jev `choice`, not a text generation to parse. Jev's
+ * confidence in the label comes from the result's TypeSafe provider metadata;
+ * a judge that reports none counts as unsure (0).
+ */
+export function createInterpretReview(model: Experimental_DecisionModel = judgeModel) {
+  return createAsyncLogic<
+    { answers: { verdict: { choice: "approve" | "reject" | "unclear" } }; confidence: number },
+    { review: string }
+  >({
+    run: async ({ input, signal }) => {
+      const { answers, providerMetadata } = await experimental_decide({
+        model,
+        state: { review: input.review },
+        questions: {
+          verdict: {
+            type: "choice" as const,
+            instructions: "What does `review`, a person's reply to a draft, decide?",
+            criteria: {
+              approve: "Accepts the draft as it is.",
+              reject:
+                "Asks for changes or criticizes the draft. Negative feedback counts as reject.",
+              unclear: "Neither accepts the draft nor asks for changes.",
+            },
+          },
+        },
+        abortSignal: signal,
+      });
+      const reported = (
+        providerMetadata?.typesafe?.confidence as Record<string, unknown> | undefined
+      )?.verdict;
+      return { answers, confidence: typeof reported === "number" ? reported : 0 };
+    },
+  });
+}
+
+/** Interprets a free-text review as a typed verdict; a failed or unsure call reads as UNCLEAR. */
+async function interpretReview(
+  text: string,
+  judge?: Experimental_DecisionModel,
+): Promise<"APPROVE" | "REJECT" | "UNCLEAR"> {
+  try {
+    const actor = createActor(createInterpretReview(judge), { input: { review: text } });
+    actor.start();
+    const { answers, confidence } = await toPromise(actor);
+    const { verdict } = answers;
+    if (confidence < REVIEW_CONFIDENCE) return "UNCLEAR";
+    return verdict.choice === "approve"
+      ? "APPROVE"
+      : verdict.choice === "reject"
+        ? "REJECT"
+        : "UNCLEAR";
+  } catch {
+    return "UNCLEAR";
+  }
+}
+
+/** Returns the still-idle snapshot unchanged (UNCLEAR interpretation). */
+function startResumeIdleEcho(
+  scenarioId: ScenarioId,
+  snapshot: Snapshot<unknown>,
+  model: string | undefined,
+): ScenarioResult {
+  const machine = machineFor(scenarioId);
+  // Describe the RESTORED snapshot, so the echoed idle carries the same event
+  // schemas (REJECT's required `reason`), labels, and hints as the original.
+  const restored = machine.resolveState(
+    snapshot as never as Parameters<AnyStateMachine["resolveState"]>[0],
+  );
+  return {
+    model,
+    status: "idle",
+    trace: [],
+    response: "Could not confidently interpret that review. Approve or reject explicitly.",
+    idle: {
+      ...describeIdle(machine, restored as AnyMachineSnapshot),
+      snapshot: snapshot as unknown as Json,
+    },
+  };
+}

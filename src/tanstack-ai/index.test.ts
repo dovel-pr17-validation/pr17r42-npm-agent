@@ -1,0 +1,933 @@
+import { describe, expect, test, vi } from "vitest";
+import { z } from "zod";
+import { EventType, type StreamChunk, type TextOptions, type TokenUsage } from "@tanstack/ai";
+import {
+  BaseTextAdapter,
+  type StructuredOutputOptions,
+  type StructuredOutputResult,
+} from "@tanstack/ai/adapters";
+import {
+  AgentDecisionExhaustedError,
+  resolveDecision,
+  type AgentDecisionRequest,
+} from "../decision.js";
+import type { AgentEventDescriptor } from "../events.js";
+import type { AgentTextRequest } from "../text-logic.js";
+import type { AgentTools } from "../types.js";
+import { AgentTruncatedError, createAgentRuntime, runToQuiescence, setupAgent } from "../index.js";
+import {
+  createTanStackAiExecutors,
+  toDecisionMessages,
+  toTanStackAiMessages,
+  toTanStackAiModelOptions,
+} from "./index.js";
+
+// ─── A scripted TanStack AI text adapter ───
+
+type FakeResponse = {
+  text?: string;
+  // `args` is the raw argument text, when it should not be `input` as JSON.
+  toolCalls?: Array<{ name: string; input?: unknown; args?: string }>;
+  finishReason?: "stop" | "length" | "tool_calls" | "content_filter";
+  usage?: TokenUsage;
+  error?: { message: string; code?: string };
+};
+
+/**
+ * Answers each model turn from a queue, streaming the AG-UI chunks a real
+ * provider adapter yields, and records every request it saw. `name` stands in
+ * for the provider, so the per-provider `modelOptions` mapping is exercised.
+ * Like the OpenAI adapter, it takes a structured output schema on the same
+ * call as tools, and answers it with JSON text.
+ */
+class FakeTextAdapter extends BaseTextAdapter<string, Record<string, any>, ["text"], any> {
+  readonly name: string;
+  readonly requests: TextOptions[] = [];
+  private queue: FakeResponse[];
+
+  constructor(responses: FakeResponse[], name = "fake") {
+    super({}, "fake-model");
+    this.name = name;
+    this.queue = [...responses];
+  }
+
+  supportsCombinedToolsAndSchema = () => true;
+
+  async *chatStream(options: TextOptions): AsyncIterable<StreamChunk> {
+    this.requests.push(options);
+    const response = this.queue.shift() ?? { error: { message: "no response queued" } };
+    const base = { model: this.model, timestamp: 0 };
+    const runId = `run-${this.requests.length}`;
+    yield { type: EventType.RUN_STARTED, runId, threadId: "t", ...base } as StreamChunk;
+    if (response.error) {
+      yield {
+        type: EventType.RUN_ERROR,
+        message: response.error.message,
+        code: response.error.code,
+        ...base,
+      } as StreamChunk;
+      return;
+    }
+    if (response.text) {
+      const messageId = `${runId}-text`;
+      yield {
+        type: EventType.TEXT_MESSAGE_START,
+        messageId,
+        role: "assistant",
+        ...base,
+      } as StreamChunk;
+      for (let i = 0; i < response.text.length; i += 4) {
+        yield {
+          type: EventType.TEXT_MESSAGE_CONTENT,
+          messageId,
+          delta: response.text.slice(i, i + 4),
+          ...base,
+        } as StreamChunk;
+      }
+      yield { type: EventType.TEXT_MESSAGE_END, messageId, ...base } as StreamChunk;
+    }
+    const toolCalls = response.toolCalls ?? [];
+    for (const [index, call] of toolCalls.entries()) {
+      const toolCallId = `${runId}-call-${index}`;
+      yield {
+        type: EventType.TOOL_CALL_START,
+        toolCallId,
+        toolCallName: call.name,
+        toolName: call.name,
+        index,
+        ...base,
+      } as StreamChunk;
+      yield {
+        type: EventType.TOOL_CALL_ARGS,
+        toolCallId,
+        delta: call.args ?? JSON.stringify(call.input ?? {}),
+        ...base,
+      } as StreamChunk;
+      yield { type: EventType.TOOL_CALL_END, toolCallId, ...base } as StreamChunk;
+    }
+    yield {
+      type: EventType.RUN_FINISHED,
+      runId,
+      threadId: "t",
+      finishReason: response.finishReason ?? (toolCalls.length > 0 ? "tool_calls" : "stop"),
+      usage: response.usage ?? { promptTokens: 5, completionTokens: 2, totalTokens: 7 },
+      ...base,
+    } as StreamChunk;
+  }
+
+  async structuredOutput(
+    options: StructuredOutputOptions<any>,
+  ): Promise<StructuredOutputResult<unknown>> {
+    this.requests.push(options.chatOptions);
+    const response = this.queue.shift() ?? { error: { message: "no response queued" } };
+    if (response.error) throw Object.assign(new Error(response.error.message), response.error);
+    const rawText = response.text ?? "";
+    return { data: JSON.parse(rawText), rawText };
+  }
+}
+
+function textRequest(overrides: Partial<AgentTextRequest> = {}): AgentTextRequest & {
+  tools: AgentTools;
+} {
+  return { model: "quick", prompt: "hi", tools: {}, ...overrides } as AgentTextRequest & {
+    tools: AgentTools;
+  };
+}
+
+const events: AgentEventDescriptor[] = [
+  {
+    type: "APPROVE",
+    toolName: "approve",
+    inputSchema: z.object({ note: z.string() }),
+  } as AgentEventDescriptor,
+  { type: "REJECT", toolName: "reject" } as AgentEventDescriptor,
+];
+
+function decisionRequest(overrides: Partial<AgentDecisionRequest> = {}): AgentDecisionRequest {
+  return {
+    model: "quick",
+    prompt: "Approve or reject?",
+    events,
+    attempts: [],
+    ...overrides,
+  } as AgentDecisionRequest;
+}
+
+// ─── generateText ───
+
+describe("createTanStackAiExecutors — generateText", () => {
+  test("returns the text, the run's usage and finish reason, and the chunks", async () => {
+    const adapter = new FakeTextAdapter([
+      {
+        text: "Hello there",
+        usage: {
+          promptTokens: 10,
+          completionTokens: 4,
+          totalTokens: 14,
+          promptTokensDetails: { cachedTokens: 3 },
+          completionTokensDetails: { reasoningTokens: 1 },
+        },
+      },
+    ]);
+    const { generateText } = createTanStackAiExecutors({ models: { quick: adapter } });
+
+    const result = await generateText(textRequest({ system: "Be brief." }));
+
+    expect(result.result).toBe("Hello there");
+    expect(result.finishReason).toBe("stop");
+    expect(result.usage).toEqual({
+      inputTokens: 10,
+      outputTokens: 4,
+      totalTokens: 14,
+      cachedInputTokens: 3,
+      reasoningTokens: 1,
+    });
+    expect(result.raw.some((chunk) => chunk.type === "RUN_FINISHED")).toBe(true);
+    expect(adapter.requests[0]!.systemPrompts).toEqual(["Be brief."]);
+    expect(adapter.requests[0]!.messages).toEqual([{ role: "user", content: "hi" }]);
+  });
+
+  test("a text request that ran out of tokens keeps its text and reports 'length'", async () => {
+    const adapter = new FakeTextAdapter([{ text: "Half a sen", finishReason: "length" }]);
+    const { generateText } = createTanStackAiExecutors({ models: { quick: adapter } });
+
+    const result = await generateText(textRequest());
+
+    expect(result.result).toBe("Half a sen");
+    expect(result.finishReason).toBe("length");
+  });
+
+  test("a RUN_ERROR chunk is thrown with its message and code", async () => {
+    const adapter = new FakeTextAdapter([{ error: { message: "rate limited", code: "429" } }]);
+    const { generateText } = createTanStackAiExecutors({ models: { quick: adapter } });
+
+    await expect(generateText(textRequest())).rejects.toMatchObject({
+      message: "rate limited",
+      code: "429",
+    });
+  });
+
+  test("an unknown model ref throws", async () => {
+    const { generateText } = createTanStackAiExecutors({
+      models: { quick: new FakeTextAdapter([]) },
+    });
+    await expect(generateText(textRequest({ model: "slow" }))).rejects.toThrow(
+      "unknown model 'slow'",
+    );
+  });
+
+  test("resolveModel resolves refs dynamically", async () => {
+    const adapter = new FakeTextAdapter([{ text: "ok" }]);
+    const seen: string[] = [];
+    const { generateText } = createTanStackAiExecutors({
+      resolveModel: (ref: string) => {
+        seen.push(ref);
+        return adapter;
+      },
+    });
+
+    expect((await generateText(textRequest({ model: "openai/gpt-6-luna" }))).result).toBe("ok");
+    expect(seen).toEqual(["openai/gpt-6-luna"]);
+  });
+});
+
+describe("createTanStackAiExecutors — structured output", () => {
+  test("sends the { result } envelope as the output schema and unwraps it", async () => {
+    const adapter = new FakeTextAdapter([{ text: '{"result":{"title":"Hi"}}' }]);
+    const { generateText } = createTanStackAiExecutors({ models: { quick: adapter } });
+
+    const result = await generateText(
+      textRequest({ outputSchema: z.object({ title: z.string() }) }),
+    );
+
+    expect(result.result).toEqual({ title: "Hi" });
+    expect(result.reasoning).toBeUndefined();
+    const schema = adapter.requests.at(-1)!.outputSchema as {
+      properties: Record<string, unknown>;
+    };
+    expect(Object.keys(schema.properties)).toEqual(["result"]);
+  });
+
+  test("reasoning opt-in adds a reasoning property and surfaces it on the result", async () => {
+    const adapter = new FakeTextAdapter([
+      { text: '{"result":{"title":"Hi"},"reasoning":"short is kind"}' },
+    ]);
+    const { generateText } = createTanStackAiExecutors({ models: { quick: adapter } });
+
+    const result = await generateText(
+      textRequest({ outputSchema: z.object({ title: z.string() }), includeReasoning: true }),
+    );
+
+    expect(result.result).toEqual({ title: "Hi" });
+    expect(result.reasoning).toBe("short is kind");
+  });
+
+  test("a structured run cut off by the token limit is an AgentTruncatedError", async () => {
+    const adapter = new FakeTextAdapter([
+      { error: { message: "max_output_tokens", code: "incomplete" } },
+    ]);
+    const { generateText } = createTanStackAiExecutors({ models: { quick: adapter } });
+
+    await expect(
+      generateText(textRequest({ outputSchema: z.object({ title: z.string() }) })),
+    ).rejects.toBeInstanceOf(AgentTruncatedError);
+  });
+});
+
+describe("createTanStackAiExecutors — tools", () => {
+  const lookup = {
+    description: "Look up a city's weather.",
+    inputSchema: z.object({ city: z.string() }),
+    execute: async ({ city }: { city: string }) => ({ city, temp: 20 }),
+  };
+
+  test("tools run in chat()'s loop within maxSteps, and usage is summed over turns", async () => {
+    const adapter = new FakeTextAdapter([
+      { toolCalls: [{ name: "lookup", input: { city: "Oslo" } }] },
+      { text: "It is 20 degrees in Oslo." },
+    ]);
+    const { generateText } = createTanStackAiExecutors({ models: { quick: adapter } });
+
+    const result = await generateText(
+      textRequest({ tools: { lookup } as unknown as AgentTools, maxSteps: 2 }),
+    );
+
+    expect(result.result).toBe("It is 20 degrees in Oslo.");
+    expect(result.finishReason).toBe("stop");
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({ toolName: "lookup", input: { city: "Oslo" } }),
+    ]);
+    expect(result.usage).toEqual({ inputTokens: 10, outputTokens: 4, totalTokens: 14 });
+    // The tool's JSON Schema reached the adapter, and its result was fed back.
+    const [first, second] = adapter.requests;
+    expect(first!.tools?.[0]).toMatchObject({
+      name: "lookup",
+      description: "Look up a city's weather.",
+      inputSchema: { type: "object", properties: { city: { type: "string" } } },
+    });
+    expect(second!.messages.at(-1)).toMatchObject({
+      role: "tool",
+      content: JSON.stringify({ city: "Oslo", temp: 20 }),
+    });
+  });
+
+  test("without maxSteps the run is a single model turn", async () => {
+    const adapter = new FakeTextAdapter([
+      { toolCalls: [{ name: "lookup", input: { city: "Oslo" } }] },
+      { text: "never asked" },
+    ]);
+    const { generateText } = createTanStackAiExecutors({ models: { quick: adapter } });
+
+    await generateText(textRequest({ tools: { lookup } as unknown as AgentTools }));
+
+    expect(adapter.requests).toHaveLength(1);
+  });
+
+  test("a tool with no execute stops the run at its call", async () => {
+    const adapter = new FakeTextAdapter([
+      { toolCalls: [{ name: "askHuman", input: { question: "Which city?" } }] },
+      { text: "never asked" },
+    ]);
+    const { generateText } = createTanStackAiExecutors({ models: { quick: adapter } });
+
+    const result = await generateText(
+      textRequest({
+        tools: {
+          askHuman: {
+            description: "Ask the user.",
+            inputSchema: z.object({ question: z.string() }),
+          },
+        } as unknown as AgentTools,
+        maxSteps: 5,
+      }),
+    );
+
+    expect(adapter.requests).toHaveLength(1);
+    expect(result.finishReason).toBe("tool-calls");
+    expect(result.toolCalls).toEqual([
+      expect.objectContaining({ toolName: "askHuman", input: { question: "Which city?" } }),
+    ]);
+  });
+});
+
+// ─── streamText ───
+
+describe("createTanStackAiExecutors — streamText", () => {
+  test("hands every delta to onChunk and returns the accumulated text", async () => {
+    const adapter = new FakeTextAdapter([{ text: "abcdefgh" }]);
+    const { streamText } = createTanStackAiExecutors({ models: { quick: adapter } });
+    const chunks: string[] = [];
+
+    const result = await streamText(textRequest(), { onChunk: (chunk) => chunks.push(chunk) });
+
+    expect(chunks).toEqual(["abcd", "efgh"]);
+    expect(result.result).toBe("abcdefgh");
+    expect(result.finishReason).toBe("stop");
+    expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 2, totalTokens: 7 });
+  });
+
+  test("refuses a structured request", async () => {
+    const { streamText } = createTanStackAiExecutors({
+      models: { quick: new FakeTextAdapter([]) },
+    });
+    await expect(
+      streamText(textRequest({ outputSchema: z.object({ title: z.string() }) })),
+    ).rejects.toThrow("must be routed to generateText");
+  });
+});
+
+// ─── decide ───
+
+describe("createTanStackAiExecutors — decide", () => {
+  test("offers one tool per event and returns the chosen event", async () => {
+    const adapter = new FakeTextAdapter([
+      { toolCalls: [{ name: "approve", input: { note: "LGTM", type: "REJECT" } }] },
+    ]);
+    const { decide } = createTanStackAiExecutors({
+      decideMode: "tool",
+      models: { quick: adapter },
+    });
+
+    const result = await decide(decisionRequest());
+
+    // The event's own type wins over a stray `type` in the tool input.
+    expect(result.event).toEqual({ note: "LGTM", type: "APPROVE" });
+    expect(result.finishReason).toBe("tool-calls");
+    expect(adapter.requests).toHaveLength(1);
+    expect(adapter.requests[0]!.tools?.map((tool) => tool.name)).toEqual(["approve", "reject"]);
+  });
+
+  test("forces a tool call through the provider's modelOptions", async () => {
+    const adapter = new FakeTextAdapter([{ toolCalls: [{ name: "reject" }] }], "openai");
+    const { decide } = createTanStackAiExecutors({
+      decideMode: "tool",
+      models: { quick: adapter },
+    });
+
+    await decide(decisionRequest({ temperature: 0 }));
+
+    expect(adapter.requests[0]!.modelOptions).toEqual({
+      parallel_tool_calls: false,
+      tool_choice: "required",
+      temperature: 0,
+    });
+
+    const anthropic = new FakeTextAdapter([{ toolCalls: [{ name: "reject" }] }], "anthropic");
+    await createTanStackAiExecutors({ models: { quick: anthropic }, decideMode: "tool" }).decide(
+      decisionRequest(),
+    );
+    expect(anthropic.requests[0]!.modelOptions).toEqual({
+      tool_choice: { type: "any", disable_parallel_tool_use: true },
+    });
+  });
+
+  // Resolves a decision against `responses`, one per model call.
+  async function resolveWith(responses: FakeResponse[]) {
+    const { decide } = createTanStackAiExecutors({
+      decideMode: "tool",
+      models: { quick: new FakeTextAdapter(responses) },
+    });
+    const seen: AgentDecisionRequest[] = [];
+    const event = await resolveDecision(decisionRequest(), {
+      decide: (attempt, info) => (seen.push(attempt), decide(attempt, info)),
+    });
+    return { event, reasons: seen.at(-1)!.attempts.map((attempt) => attempt.reason) };
+  }
+  const reject: FakeResponse = { toolCalls: [{ name: "reject" }] };
+
+  test("a text answer instead of a tool call is retried, its usage still reported", async () => {
+    const { decide } = createTanStackAiExecutors({
+      decideMode: "tool",
+      models: { quick: new FakeTextAdapter([{ text: "I approve." }]) },
+    });
+    const result = await decide(decisionRequest());
+    expect(result.rejected).toEqual({
+      failure: "unknown-event",
+      reason: "no tool was called; call exactly one of: approve, reject",
+    });
+    expect(result.usage).toEqual({ inputTokens: 5, outputTokens: 2, totalTokens: 7 });
+
+    expect(await resolveWith([{ text: "I approve." }, reject])).toEqual({
+      event: { type: "REJECT" },
+      reasons: ["no tool was called; call exactly one of: approve, reject"],
+    });
+  });
+
+  test("a call to an unknown tool is retried, naming the valid tools", async () => {
+    expect(await resolveWith([{ toolCalls: [{ name: "escalate" }] }, reject])).toEqual({
+      event: { type: "REJECT" },
+      reasons: ["tool 'escalate' was not offered; valid tools: approve, reject"],
+    });
+  });
+
+  test("malformed tool arguments are retried as an invalid payload", async () => {
+    const { event, reasons } = await resolveWith([
+      { toolCalls: [{ name: "approve", args: '{"note": "LG' }] },
+      reject,
+    ]);
+    expect(event).toEqual({ type: "REJECT" });
+    expect(reasons).toEqual(["the arguments for tool 'approve' were not valid JSON"]);
+  });
+
+  test("answers that never name a candidate exhaust the retries", async () => {
+    const { decide } = createTanStackAiExecutors({
+      decideMode: "tool",
+      models: { quick: new FakeTextAdapter([{ text: "no" }, { text: "no" }, { text: "no" }]) },
+    });
+    const error = await resolveDecision(decisionRequest(), { decide }).catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(AgentDecisionExhaustedError);
+    expect((error as AgentDecisionExhaustedError).attempts.map((a) => a.failure)).toEqual([
+      "unknown-event",
+      "unknown-event",
+      "unknown-event",
+    ]);
+  });
+
+  test("failed attempts are appended as user messages", () => {
+    const { messages } = toDecisionMessages(
+      decisionRequest({
+        attempts: [{ error: "bad input", event: { type: "APPROVE" } }],
+      } as unknown as Partial<AgentDecisionRequest>),
+    );
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toEqual({ role: "user", content: "Approve or reject?" });
+    expect(messages[1]!.role).toBe("user");
+  });
+});
+
+// ─── Mapping ───
+
+describe("toTanStackAiMessages", () => {
+  test("system messages become system prompts; tool calls and results keep their ids", () => {
+    const mapped = toTanStackAiMessages({
+      system: "Base.",
+      messages: [
+        { role: "system", content: "Extra." },
+        { role: "user", content: "What's the weather?" },
+        {
+          role: "assistant",
+          content: [
+            { type: "text", text: "Checking." },
+            { type: "tool-call", toolCallId: "c1", toolName: "lookup", input: { city: "Oslo" } },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool-result",
+              toolCallId: "c1",
+              toolName: "lookup",
+              output: { type: "json", value: { temp: 20 } },
+            },
+          ],
+        },
+      ],
+    } as Parameters<typeof toTanStackAiMessages>[0]);
+
+    expect(mapped.systemPrompts).toEqual(["Base.", "Extra."]);
+    expect(mapped.messages).toEqual([
+      { role: "user", content: "What's the weather?" },
+      {
+        role: "assistant",
+        content: "Checking.",
+        toolCalls: [
+          {
+            id: "c1",
+            type: "function",
+            function: { name: "lookup", arguments: JSON.stringify({ city: "Oslo" }) },
+          },
+        ],
+      },
+      { role: "tool", toolCallId: "c1", content: JSON.stringify({ temp: 20 }) },
+    ]);
+  });
+
+  test("image parts become url or base64 data sources", () => {
+    const { messages } = toTanStackAiMessages({
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "image", image: new URL("https://example.com/a.png") },
+            { type: "image", image: "data:image/png;base64,AAAA" },
+          ],
+        },
+      ],
+    } as Parameters<typeof toTanStackAiMessages>[0]);
+
+    expect(messages[0]!.content).toEqual([
+      { type: "image", source: { type: "url", value: "https://example.com/a.png" } },
+      { type: "image", source: { type: "data", value: "AAAA", mimeType: "image/png" } },
+    ]);
+  });
+});
+
+describe("toTanStackAiModelOptions", () => {
+  const request = {
+    temperature: 0.2,
+    topP: 0.9,
+    topK: 40,
+    maxOutputTokens: 100,
+    seed: 7,
+    stopSequences: ["END"],
+    toolChoice: { type: "tool" as const, name: "lookup" },
+  };
+
+  test("openai: Responses API keys; no top_k, seed, or stop", () => {
+    expect(toTanStackAiModelOptions({ name: "openai" }, request)).toEqual({
+      temperature: 0.2,
+      top_p: 0.9,
+      max_output_tokens: 100,
+      tool_choice: { type: "function", name: "lookup" },
+    });
+  });
+
+  test("anthropic: Messages API keys; no seed", () => {
+    expect(toTanStackAiModelOptions({ name: "anthropic" }, request)).toEqual({
+      temperature: 0.2,
+      top_p: 0.9,
+      top_k: 40,
+      max_tokens: 100,
+      stop_sequences: ["END"],
+      tool_choice: { type: "tool", name: "lookup" },
+    });
+  });
+
+  test("anthropic: 'none' disables tool calls rather than being dropped", () => {
+    expect(toTanStackAiModelOptions({ name: "anthropic" }, { toolChoice: "none" })).toEqual({
+      tool_choice: { type: "none" },
+    });
+  });
+
+  test("gemini: generation config keys and a function-calling config", () => {
+    expect(toTanStackAiModelOptions({ name: "gemini" }, request)).toEqual({
+      temperature: 0.2,
+      topP: 0.9,
+      topK: 40,
+      maxOutputTokens: 100,
+      seed: 7,
+      stopSequences: ["END"],
+      toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["lookup"] } },
+    });
+  });
+
+  test("an unknown provider gets nothing; unset keys are omitted", () => {
+    expect(toTanStackAiModelOptions({ name: "ollama" }, request)).toEqual({});
+    expect(toTanStackAiModelOptions({ name: "openai" }, {})).toEqual({});
+  });
+});
+
+describe("settings precedence", () => {
+  test("host settings, then the model entry's, then the request's own settings", async () => {
+    const adapter = new FakeTextAdapter([{ text: "ok" }], "openai");
+    const { generateText } = createTanStackAiExecutors({
+      models: {
+        quick: {
+          adapter,
+          settings: { modelOptions: { reasoning: { effort: "high" }, temperature: 0.5 } },
+        },
+      },
+      settings: (request) => ({
+        metadata: { request: request.name },
+        modelOptions: { temperature: 1, store: false },
+      }),
+    });
+
+    await generateText(textRequest({ name: "draft", temperature: 0 }));
+
+    expect(adapter.requests[0]!.modelOptions).toEqual({
+      store: false,
+      reasoning: { effort: "high" },
+      temperature: 0,
+    });
+    expect(adapter.requests[0]!.metadata).toEqual({ request: "draft" });
+  });
+});
+
+describe("response messages", () => {
+  const lookup = {
+    inputSchema: z.object({ city: z.string() }),
+    execute: async ({ city }: { city: string }) => ({ city, temp: 20 }),
+  };
+
+  test("a tool loop returns each turn's assistant message and the tool results between", async () => {
+    const adapter = new FakeTextAdapter([
+      { text: "Checking.", toolCalls: [{ name: "lookup", input: { city: "Oslo" } }] },
+      { text: "It is 20 degrees." },
+    ]);
+    const { generateText } = createTanStackAiExecutors({ models: { quick: adapter } });
+
+    const { messages } = await generateText(
+      textRequest({ tools: { lookup } as unknown as AgentTools, maxSteps: 2 }),
+    );
+
+    expect(messages).toEqual([
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "Checking." },
+          {
+            type: "tool-call",
+            toolCallId: "run-1-call-0",
+            toolName: "lookup",
+            input: { city: "Oslo" },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        content: [
+          {
+            type: "tool-result",
+            toolCallId: "run-1-call-0",
+            toolName: "lookup",
+            output: { type: "json", value: { city: "Oslo", temp: 20 } },
+          },
+        ],
+      },
+      { role: "assistant", content: [{ type: "text", text: "It is 20 degrees." }] },
+    ]);
+
+    // They replay into the next request as the same conversation.
+    expect(toTanStackAiMessages({ messages }).messages).toEqual([
+      {
+        role: "assistant",
+        content: "Checking.",
+        toolCalls: [
+          {
+            id: "run-1-call-0",
+            type: "function",
+            function: { name: "lookup", arguments: JSON.stringify({ city: "Oslo" }) },
+          },
+        ],
+      },
+      {
+        role: "tool",
+        toolCallId: "run-1-call-0",
+        content: JSON.stringify({ city: "Oslo", temp: 20 }),
+      },
+      { role: "assistant", content: "It is 20 degrees." },
+    ]);
+  });
+
+  test("a plain text reply is one assistant message, from generateText and streamText", async () => {
+    const adapter = new FakeTextAdapter([{ text: "Hi." }, { text: "Hi." }]);
+    const { generateText, streamText } = createTanStackAiExecutors({ models: { quick: adapter } });
+    const expected = [{ role: "assistant", content: [{ type: "text", text: "Hi." }] }];
+
+    expect((await generateText(textRequest())).messages).toEqual(expected);
+    expect((await streamText(textRequest())).messages).toEqual(expected);
+  });
+});
+
+describe("tool choice", () => {
+  const lookup = {
+    inputSchema: z.object({ city: z.string() }),
+    execute: async () => ({ temp: 20 }),
+  };
+  const twoTurns = () => [
+    { toolCalls: [{ name: "lookup", input: { city: "Oslo" } }] },
+    { text: "It is 20 degrees." },
+  ];
+
+  test("a forced choice applies to the first turn only, so the model can answer", async () => {
+    const adapter = new FakeTextAdapter(twoTurns(), "openai");
+    const { generateText } = createTanStackAiExecutors({ models: { quick: adapter } });
+
+    const result = await generateText(
+      textRequest({
+        tools: { lookup } as unknown as AgentTools,
+        toolChoice: "required",
+        maxSteps: 2,
+        temperature: 0,
+      }),
+    );
+
+    expect(result.result).toBe("It is 20 degrees.");
+    expect(adapter.requests.map((request) => request.modelOptions)).toEqual([
+      { tool_choice: "required", temperature: 0 },
+      { temperature: 0 },
+    ]);
+  });
+
+  test("after the first turn, a host's own tool choice comes back", async () => {
+    const adapter = new FakeTextAdapter(twoTurns(), "openai");
+    const { generateText } = createTanStackAiExecutors({
+      models: { quick: adapter },
+      settings: { modelOptions: { tool_choice: "auto" } },
+    });
+
+    await generateText(
+      textRequest({
+        tools: { lookup } as unknown as AgentTools,
+        toolChoice: "required",
+        maxSteps: 2,
+      }),
+    );
+
+    expect(adapter.requests.map((request) => request.modelOptions?.tool_choice)).toEqual([
+      "required",
+      "auto",
+    ]);
+  });
+});
+
+describe("cancellation", () => {
+  test("the abort listener is removed once a call settles", async () => {
+    const controller = new AbortController();
+    const add = vi.spyOn(controller.signal, "addEventListener");
+    const remove = vi.spyOn(controller.signal, "removeEventListener");
+    const { generateText } = createTanStackAiExecutors({
+      models: { quick: new FakeTextAdapter([{ text: "a" }, { error: { message: "boom" } }]) },
+    });
+
+    await generateText(textRequest(), { signal: controller.signal });
+    await expect(generateText(textRequest(), { signal: controller.signal })).rejects.toThrow(
+      "boom",
+    );
+
+    expect(add).toHaveBeenCalledTimes(2);
+    expect(remove.mock.calls.map(([, listener]) => listener)).toEqual(
+      add.mock.calls.map(([, listener]) => listener),
+    );
+  });
+
+  test("an aborted call throws the abort reason", async () => {
+    const controller = new AbortController();
+    controller.abort(new Error("stop"));
+    const { generateText } = createTanStackAiExecutors({
+      models: { quick: new FakeTextAdapter([{ text: "a" }]) },
+    });
+
+    await expect(generateText(textRequest(), { signal: controller.signal })).rejects.toThrow(
+      "stop",
+    );
+  });
+});
+
+// ─── With the runtime ───
+
+describe("createTanStackAiExecutors with createAgentRuntime", () => {
+  test("a machine's generateText runs through TanStack AI and its usage is aggregated", async () => {
+    const adapter = new FakeTextAdapter([{ text: "hello" }]);
+    const models = { quick: adapter };
+    const agent = setupAgent({ context: z.object({}), input: z.object({}), models });
+    const machine = agent.createMachine({
+      context: ({ input }) => input,
+      initial: "writing",
+      states: {
+        writing: {
+          invoke: {
+            src: "agent.generateText",
+            input: { model: "quick", prompt: "hi" },
+            onDone: { target: "done" },
+          },
+        },
+        done: { type: "final" },
+      },
+    });
+
+    const result = await runToQuiescence(
+      createAgentRuntime(machine, { executors: createTanStackAiExecutors({ models }) }),
+      { input: {} },
+    );
+
+    expect(result.status).toBe("done");
+    expect(result.usage).toMatchObject({ inputTokens: 5, outputTokens: 2, totalTokens: 7 });
+  });
+});
+
+describe("createTanStackAiExecutors model sources", () => {
+  function build() {
+    const models = { quick: new FakeTextAdapter([{ text: "hello" }]) };
+    const agentSetup = setupAgent({ context: z.object({}), input: z.object({}), models });
+    const machine = agentSetup.createMachine({
+      context: ({ input }) => input,
+      initial: "done",
+      states: { done: { type: "final" } },
+    });
+    return { models, agentSetup, machine };
+  }
+
+  test("accepts the legacy { models } object, a setupAgent(...) result, and a machine", async () => {
+    for (const pick of [
+      ({ models }: ReturnType<typeof build>) => createTanStackAiExecutors({ models }),
+      ({ agentSetup }: ReturnType<typeof build>) => createTanStackAiExecutors(agentSetup),
+      ({ machine }: ReturnType<typeof build>) => createTanStackAiExecutors(machine),
+    ]) {
+      const { generateText } = pick(build());
+      expect((await generateText(textRequest())).result).toBe("hello");
+    }
+  });
+
+  test("throws at construction for a wrong-shaped argument, naming what it got", () => {
+    expect(() => createTanStackAiExecutors({} as never)).toThrow(
+      /createTanStackAiExecutors: .*got an empty object/,
+    );
+    const bare = setupAgent({ context: z.object({}), input: z.object({}) });
+    const bareMachine = bare.createMachine({
+      context: ({ input }) => input,
+      initial: "done",
+      states: { done: { type: "final" } },
+    });
+    expect(() => createTanStackAiExecutors(bareMachine)).toThrow(
+      /got a machine whose setupAgent\(\.\.\.\) declared no models/,
+    );
+  });
+});
+
+describe("createTanStackAiExecutors — decideMode", () => {
+  test("object mode (default): an open choice sends a `{ event }` schema and reads the event", async () => {
+    const adapter = new FakeTextAdapter([{ text: '{"event":{"type":"APPROVE","note":"ok"}}' }]);
+    const result = await createTanStackAiExecutors({ models: { quick: adapter } }).decide(
+      decisionRequest(),
+    );
+    expect(result.event).toEqual({ type: "APPROVE", note: "ok" });
+    const sent = adapter.requests[0]!;
+    expect(sent.tools ?? []).toHaveLength(0);
+    const schema = sent.outputSchema as any;
+    expect(schema.required).toEqual(["event"]);
+    expect(schema.properties.event.anyOf.map((b: any) => b.properties.type.enum[0])).toEqual([
+      "APPROVE",
+      "REJECT",
+    ]);
+  });
+
+  test("object mode: a closed choice sends a `{ choice }` enum and maps the id back", async () => {
+    const options = [{ event: { type: "REJECT" } }, { event: { type: "APPROVE", note: "fine" } }];
+    const probe = new FakeTextAdapter([{ text: '{"choice":"none"}' }]);
+    await createTanStackAiExecutors({ models: { quick: probe } }).decide(
+      decisionRequest({ options }),
+    );
+    const ids = (probe.requests[0]!.outputSchema as any).properties.choice.enum;
+    const adapter = new FakeTextAdapter([{ text: JSON.stringify({ choice: ids[1] }) }]);
+    const result = await createTanStackAiExecutors({ models: { quick: adapter } }).decide(
+      decisionRequest({ options }),
+    );
+    expect(result.event).toEqual({ type: "APPROVE", note: "fine" });
+  });
+
+  test("object mode: an unknown type and bad JSON are rejected", async () => {
+    const decideWith = (text: string) =>
+      createTanStackAiExecutors({ models: { quick: new FakeTextAdapter([{ text }]) } }).decide(
+        decisionRequest(),
+      );
+    expect((await decideWith('{"event":{"type":"NOPE"}}')).rejected).toMatchObject({
+      failure: "unknown-event",
+    });
+    expect((await decideWith("{not json")).rejected).toMatchObject({ failure: "invalid-payload" });
+  });
+
+  test("tool mode: an answer with more than one tool call is rejected", async () => {
+    const adapter = new FakeTextAdapter([
+      { toolCalls: [{ name: "reject" }, { name: "approve", input: { note: "x" } }] },
+    ]);
+    const result = await createTanStackAiExecutors({
+      models: { quick: adapter },
+      decideMode: "tool",
+    }).decide(decisionRequest());
+    expect(result.event).toBeUndefined();
+    expect(result.rejected?.reason).toContain("2 tools were called");
+  });
+});

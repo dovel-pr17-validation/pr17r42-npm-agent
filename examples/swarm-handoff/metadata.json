@@ -1,0 +1,28 @@
+{
+  "name": "swarm-handoff",
+  "title": "Two concierges, one conversation (swarm handoff)",
+  "kind": "pattern",
+  "origin": {
+    "type": "pattern",
+    "source": "Active-agent swarm / handoff multi-agent pattern",
+    "url": "https://github.com/langchain-ai/langgraphjs/tree/main/examples"
+  },
+  "comparison": {
+    "targets": ["swarm", "handoff"],
+    "purpose": "Two specialists share one conversation. For each new message a router model picks HANDOFF or KEEP; a guard rejects a handoff to the agent already holding the mic, the agent that takes over reads the whole conversation, both survive a JSON snapshot round-trip, and after MAX_TURNS replies only END is offered."
+  },
+  "starters": [
+    {
+      "label": "Plan a 3-day trip to Lisbon",
+      "input": {
+        "message": "I want a 3-day trip to Lisbon."
+      }
+    },
+    {
+      "label": "Find flights and a hotel for next weekend",
+      "input": {
+        "message": "Find me flights and a hotel for next weekend."
+      }
+    }
+  ]
+}

@@ -1,0 +1,927 @@
+/**
+ * Chat-with-PDF quiz mode — the same recipe agentcn ships, with the sequencing
+ * lifted out of the prompt and into the machine.
+ *
+ * The agentcn recipe (`registry/*​/chat-with-pdf/instructions.md`) writes the
+ * quiz loop as prose the model is asked to obey:
+ *
+ *   - "Ask ONE question at a time"
+ *   - "After 3-4 questions, call the tool AGAIN to get fresh content from
+ *     different pages"
+ *   - "ALWAYS include the documentId parameter to query the correct document"
+ *   - "Every question MUST include a hint telling the user which page has the
+ *     answer"
+ *   - "ONLY create questions from retrieved content"
+ *   - "If multiple documents exist, ask the user which one they want"
+ *
+ * Those are a counter, a coverage set, a piece of session state, a formatting
+ * invariant, a grounding invariant, and a branch. Written as instructions they
+ * hold for a few turns and then drift, because the *rules* live in the system
+ * prompt but the *state they talk about* lives only in conversation history.
+ *
+ * Here each one is structure instead:
+ *   - one question per entry into `asking`, so "one at a time" is not a request
+ *   - `sinceRefresh` / `refreshEvery` guard, so the refresh is a transition
+ *   - `pagesCovered` passed to retrieval as `excludePages`, so "different pages"
+ *     is enforced by the query, not remembered by the model
+ *   - `documentId` in context, threaded into every retrieval by the machine
+ *   - the page hint is read off the retrieved chunk, never generated
+ *   - grading is grounded on the exact chunk that produced the question, and
+ *     the verdict is a Jev judgment (see below), not the text model's say-so
+ *   - context keeps page numbers, not passages (`pageText` looks one up when a
+ *     request needs it), so an open question never sits next to its answer
+ *   - `choosingDocument` is a real idle state, so an ambiguous corpus cannot be
+ *     silently guessed past
+ *
+ * What stays prose: voice and question formatting (`QUIZ_VOICE`). Models follow
+ * that well, and encoding it as states would be ceremony.
+ *
+ * Grading is split along the judgment/generation line. `grading` calls the AI
+ * SDK's `experimental_decide` with Jev (`@ai-sdk/typesafe-ai`) as the
+ * decision model: one boolean question, `correct`, over
+ * `{ passage, question, answer }`,
+ * and the answer counts as correct when that probability clears
+ * `CORRECT_THRESHOLD`. `explaining` then asks the text model only for the prose
+ * the learner reads (the expected answer and an explanation), told the verdict
+ * rather than asked for it.
+ *
+ * Retrieval is honest keyword scoring over an in-file corpus (same approach as
+ * `examples/rag`). A real build swaps `queryPdfContent` for a vector store; the
+ * machine shape is unchanged.
+ *
+ * Run: OPENAI_API_KEY=... TYPESAFE_AI_API_KEY=... npx tsx examples/chat-with-pdf/index.ts
+ */
+import { z } from "zod";
+import type { SnapshotFrom } from "xstate";
+import { createAsyncLogic } from "xstate";
+import { openai } from "@ai-sdk/openai";
+import { experimental_decide, type Experimental_DecisionModel } from "ai";
+import { typeSafeAi } from "@ai-sdk/typesafe-ai";
+import { createAiSdkExecutors } from "@statelyai/agent/ai-sdk";
+import {
+  createAgentSchemas,
+  getInteraction,
+  interactionMetaSchema,
+  createAgentRuntime,
+  runToQuiescence,
+  setupAgent,
+} from "@statelyai/agent";
+
+/**
+ * The part of the original instructions.md that is genuinely prose: tone and
+ * question shape. Everything the original said about *sequencing* is gone from
+ * this string — it moved into the machine below.
+ */
+const QUIZ_VOICE = [
+  "You write quiz questions from a passage of a document.",
+  "Write exactly one question from the passage you are given.",
+  "Mix question types across a session: multiple choice, short answer, true/false.",
+  "For multiple choice, give four plausible options; exactly one is correct.",
+  "If the passage contains code, include the code in the question so it can be",
+  "answered without opening the document.",
+  "Be encouraging — learning is the goal.",
+].join("\n");
+
+/** A page of an indexed document. Stands in for a chunk in a vector store. */
+const chunkSchema = z.object({
+  documentId: z.string(),
+  pageNumber: z.number(),
+  content: z.string(),
+});
+
+type Chunk = z.infer<typeof chunkSchema>;
+
+const questionSchema = z.object({
+  type: z.enum(["multiple-choice", "short-answer", "true-false"]),
+  question: z.string(),
+  /** Empty for short-answer and true/false. */
+  choices: z.array(z.string()),
+});
+
+const gradeSchema = z.object({
+  correct: z.boolean(),
+  /** The answer the passage supports, shown back to the learner. */
+  expected: z.string(),
+  explanation: z.string(),
+});
+
+/** An answer counts as correct when Jev's probability that it is clears this. */
+export const CORRECT_THRESHOLD = 0.5;
+
+/**
+ * The verdict as a judgment: the passage the question came from, the
+ * question, and the learner's answer are the state; `correct` is one boolean
+ * question. The judge model is injected by tests and hosts; the default is
+ * Jev, which reads `TYPESAFE_AI_API_KEY` from the environment.
+ */
+export function createGradeAnswer(model: Experimental_DecisionModel = judgeModel) {
+  return createAsyncLogic<
+    { answers: { correct: { probability: number } } },
+    { prompt: string; answer: string; sourceText: string; pageNumber: number }
+  >({
+    run: async ({ input, signal }) => {
+      const { answers } = await experimental_decide({
+        model,
+        state: {
+          passage: { page: input.pageNumber, text: input.sourceText },
+          question: input.prompt,
+          answer: input.answer,
+        },
+        questions: {
+          correct: {
+            type: "boolean" as const,
+            instructions:
+              "Is `answer` a correct answer to `question`, according to `passage.text`?",
+            criteria: {
+              true: "Right in substance per the passage, even if worded differently.",
+              false: "Wrong, off the point, or not supported by the passage.",
+            },
+          },
+        },
+        abortSignal: signal,
+      });
+      return { answers };
+    },
+  });
+}
+
+/**
+ * Sample data: two indexed "documents". Two, not one, so the ambiguous-corpus
+ * branch is real rather than hypothetical.
+ */
+export const SAMPLE_LIBRARY: Array<{ id: string; title: string; pages: Chunk[] }> = [
+  {
+    id: "statecharts",
+    title: "Statecharts in Practice",
+    pages: [
+      "A state machine is in exactly one of a finite set of states at a time. Events cause transitions between those states.",
+      "Context is the extended state of a machine: arbitrary data stored alongside the finite state and updated during transitions.",
+      "A guard is a condition that must hold for a transition to be taken. Guards are how illegal transitions stay impossible.",
+      "Invoking an actor starts it when a state is entered and stops it when the state is exited. onDone and onError handle its result.",
+      "Hierarchical states nest: a parent state's transitions apply to every child, so shared handling is written once.",
+      "Parallel states run several regions at the same time. The machine is in one state per region.",
+      "A final state signals that a machine or region is done. A top-level final state produces the machine's output.",
+      "History states remember which child was active when a parent was last exited, so re-entry resumes where it left off.",
+      "Snapshots serialize the whole running state, which is what makes a paused machine resumable in a different process.",
+    ].map((content, index) => ({ documentId: "statecharts", pageNumber: index + 1, content })),
+  },
+  {
+    id: "retrieval",
+    title: "Retrieval Systems",
+    pages: [
+      "Chunking splits a document into passages small enough to embed but large enough to stand alone when read.",
+      "An embedding maps text to a vector so that semantically similar passages land near each other.",
+      "Top-k retrieval returns the k nearest chunks to a query vector. Larger k trades precision for recall.",
+      "Stratified sampling draws from early, middle, and late sections instead of clustering on whichever section scores highest.",
+      "Grounding means answering only from retrieved text. An answer with no supporting chunk is a hallucination regardless of how plausible it reads.",
+      "Citations tie each claim back to the passage it came from, which is what makes a grounded answer checkable.",
+    ].map((content, index) => ({ documentId: "retrieval", pageNumber: index + 1, content })),
+  },
+];
+
+const STOP_WORDS = new Set([
+  "a",
+  "an",
+  "the",
+  "is",
+  "are",
+  "of",
+  "to",
+  "in",
+  "and",
+  "what",
+  "how",
+  "why",
+  "do",
+  "does",
+  "about",
+  "for",
+  "with",
+  "that",
+  "this",
+  "it",
+]);
+
+/** Shared content words between a topic and a page. Not embeddings. */
+function scorePage(topic: string, text: string): number {
+  const terms = new Set(
+    topic
+      .toLowerCase()
+      .split(/[^a-z]+/)
+      .filter((word) => word.length > 2 && !STOP_WORDS.has(word)),
+  );
+  const haystack = text.toLowerCase();
+  let score = 0;
+  for (const term of terms) {
+    if (haystack.includes(term)) score += 1;
+  }
+  return score;
+}
+
+/**
+ * Take from early, middle, and late thirds in turn.
+ *
+ * The original instructions asked the model to notice that "the tool returns a
+ * stratified sample". Here the tool actually returns one.
+ */
+function stratify(pages: Chunk[], limit: number): Chunk[] {
+  if (pages.length <= limit) return pages;
+  const third = Math.ceil(pages.length / 3);
+  const bands = [pages.slice(0, third), pages.slice(third, third * 2), pages.slice(third * 2)];
+  const out: Chunk[] = [];
+  for (let round = 0; out.length < limit; round += 1) {
+    const before = out.length;
+    for (const band of bands) {
+      const page = band[round];
+      if (page && out.length < limit) out.push(page);
+    }
+    // Every band is exhausted — stop rather than spin.
+    if (out.length === before) break;
+  }
+  return out;
+}
+
+export interface QueryPdfInput {
+  documentId: string;
+  topic: string;
+  pageStart: number | null;
+  pageEnd: number | null;
+  /** Pages already quizzed on. The query never returns these. */
+  excludePages: number[];
+  limit: number;
+}
+
+/** Page-range filter, keyword score, exclusion, then stratified sample. */
+export function queryPdfContent(input: QueryPdfInput): Chunk[] {
+  const document = SAMPLE_LIBRARY.find((entry) => entry.id === input.documentId);
+  if (!document) return [];
+  const excluded = new Set(input.excludePages);
+  const inRange = document.pages.filter(
+    (page) =>
+      !excluded.has(page.pageNumber) &&
+      (input.pageStart === null || page.pageNumber >= input.pageStart) &&
+      (input.pageEnd === null || page.pageNumber <= input.pageEnd),
+  );
+  // A blank topic means "anywhere in range" — keep page order and stratify.
+  const candidates = input.topic.trim()
+    ? inRange
+        .map((page) => ({ page, score: scorePage(input.topic, page.content) }))
+        .filter((scored) => scored.score > 0)
+        .sort(
+          (left, right) => right.score - left.score || left.page.pageNumber - right.page.pageNumber,
+        )
+        .map((scored) => scored.page)
+    : inRange;
+  return stratify(candidates, input.limit);
+}
+
+/**
+ * A page's text, fetched by id — the "vector store" lookup. Context keeps page
+ * NUMBERS, never passages: a passage holds the answer to its question, so its
+ * text is looked up only when a request needs it, and nothing a host renders
+ * from context while the learner thinks can give the answer away.
+ */
+export function pageText(documentId: string | null, pageNumber: number): string {
+  const document = SAMPLE_LIBRARY.find((entry) => entry.id === documentId);
+  return document?.pages.find((page) => page.pageNumber === pageNumber)?.content ?? "";
+}
+
+/** A grade plus the passage it was grounded on: everything the label needs. */
+const gradedAnswerSchema = z.object({
+  correct: z.boolean(),
+  expected: z.string(),
+  explanation: z.string(),
+  pageNumber: z.number(),
+  sourceText: z.string(),
+});
+
+const resultSchema = z.object({
+  pageNumber: z.number(),
+  prompt: z.string(),
+  answer: z.string(),
+  correct: z.boolean(),
+  explanation: z.string(),
+});
+
+const models = {
+  quiz: openai("gpt-6-luna"),
+};
+
+/**
+ * The judge: TypeSafe's Jev through the AI SDK's decision-model provider.
+ * Reads `TYPESAFE_AI_API_KEY`. Tests pass a mock decision model instead.
+ */
+const judgeModel: Experimental_DecisionModel = typeSafeAi.decisionModel("jev-latest");
+
+export const chatWithPdfSchemas = createAgentSchemas({
+  // The library's own interaction protocol, not a per-machine restatement.
+  meta: interactionMetaSchema,
+  context: z.object({
+    /** Session state, not a prompt reminder: every retrieval reads it. */
+    documentId: z.string().nullable(),
+    documentTitle: z.string(),
+    topic: z.string(),
+    pageStart: z.number().nullable(),
+    pageEnd: z.number().nullable(),
+    maxQuestions: z.number(),
+    /** Refresh retrieval after this many questions. Was "after 3-4 questions". */
+    refreshEvery: z.number(),
+    /** Pages retrieved in the current batch, in the order they are quizzed. */
+    batch: z.array(z.number()),
+    chunkCursor: z.number(),
+    /** Was "get fresh content from different pages". Now a query parameter. */
+    pagesCovered: z.array(z.number()),
+    questionsAsked: z.number(),
+    sinceRefresh: z.number(),
+    /** The question awaiting an answer, as the learner reads it ("" when none). */
+    question: z.string(),
+    /** The page `question` came from — grading is grounded on that page's text. */
+    questionPage: z.number().nullable(),
+    results: z.array(resultSchema),
+    /** What the learner typed for the pending question, awaiting grading. */
+    answer: z.string(),
+    /** Jev's verdict on `answer`, awaiting its explanation; `null` otherwise. */
+    verdict: z.boolean().nullable(),
+    /** The previous grade, as DATA — the label renders it above the next question. */
+    lastGrade: gradedAnswerSchema.nullable(),
+    /** Set when retrieval comes back empty; explains an early summary. */
+    exhausted: z.boolean(),
+  }),
+  // Defaults are declared once, here: `runAgent` validates input against this
+  // schema before the actor starts, so the context factory below receives them
+  // already filled. A run can start with nothing but a question budget — the
+  // machine resolves the rest (document choice included) as states.
+  input: z.object({
+    documentId: z.string().nullable().default(null),
+    topic: z.string().default(""),
+    pageStart: z.number().nullable().default(null),
+    pageEnd: z.number().nullable().default(null),
+    maxQuestions: z.number().default(6),
+    refreshEvery: z.number().default(3),
+  }),
+  output: z.object({
+    /** The score in a sentence, plus the final verdict when nothing showed it yet. */
+    summary: z.string(),
+    documentId: z.string(),
+    correct: z.number(),
+    answered: z.number(),
+    pagesCovered: z.array(z.number()),
+    results: z.array(resultSchema),
+    exhausted: z.boolean(),
+  }),
+  events: {
+    /** Free text at the document picker; matched against id or title. */
+    SELECT_DOCUMENT: z.object({ documentId: z.string() }),
+    ANSWER: z.object({ text: z.string() }),
+    SKIP: z.object({}),
+    STOP: z.object({}),
+  },
+  emitted: {
+    QUESTION: z.object({ prompt: z.string(), pageNumber: z.number() }),
+    GRADED: z.object({ correct: z.boolean(), expected: z.string(), explanation: z.string() }),
+  },
+});
+
+const agentSetup = setupAgent({
+  schemas: chatWithPdfSchemas,
+  models,
+  actors: {
+    // Plain typed actor — no model in the retrieval path.
+    retrieve: createAsyncLogic<Chunk[], QueryPdfInput>({
+      run: async ({ input }) => queryPdfContent(input),
+    }),
+    // The verdict: a Jev judgment (see createGradeAnswer).
+    gradeAnswer: createGradeAnswer(),
+  },
+  requests: {
+    writeQuestion: {
+      schemas: {
+        input: z.object({
+          passage: z.string(),
+          questionNumber: z.number(),
+          askedSoFar: z.array(z.string()),
+        }),
+        output: questionSchema,
+      },
+      model: "quiz",
+      system: QUIZ_VOICE,
+      prompt: ({ input }) =>
+        [
+          `Passage:\n${input.passage}`,
+          input.askedSoFar.length
+            ? `\nAlready asked (vary the type and angle):\n${input.askedSoFar.join("\n")}`
+            : "",
+          `\nWrite question ${input.questionNumber} from this passage only.`,
+        ].join("\n"),
+    },
+    // The prose around the verdict Jev already gave: what the passage says
+    // the answer is, and why.
+    explainGrade: {
+      schemas: {
+        input: z.object({
+          prompt: z.string(),
+          answer: z.string(),
+          // The explanation sees the source passage, so it cannot explain from memory.
+          sourceText: z.string(),
+          pageNumber: z.number(),
+          correct: z.boolean(),
+        }),
+        output: gradeSchema.pick({ expected: true, explanation: true }),
+      },
+      model: "quiz",
+      // The label already shows the verdict, `expected`, and a quote of the
+      // passage with its page, so each piece is asked for once, not restated.
+      system:
+        "A quiz answer has been graded against the source passage. Explain the grade " +
+        "from the passage ONLY. Be encouraging. " +
+        "Return `expected` as the answer the passage supports: a short phrase, not the " +
+        "passage's full sentence. " +
+        "Return `explanation` as ONE sentence of at most 12 words about the learner's " +
+        "answer itself: what it got right, or exactly what it got wrong " +
+        '(e.g. "B swaps entry and exit." or "Nice — you named both handlers."). ' +
+        "The verdict, `expected`, and a quote of the passage with its page are shown next " +
+        'to it, so do NOT start with "Correct"/"Incorrect", do NOT restate `expected`, and ' +
+        "do NOT quote, paraphrase, or cite the passage.",
+      prompt: ({ input }) =>
+        [
+          `Source passage (page ${input.pageNumber}):\n${input.sourceText}`,
+          `\nQuestion: ${input.prompt}`,
+          `Learner's answer: ${input.answer}`,
+          `Grade: ${input.correct ? "correct" : "incorrect"}`,
+        ].join("\n"),
+    },
+  },
+  states: {
+    // `asking` always sets `questionPage` before `awaitingAnswer` / `grading`
+    // read it, so those two states can be narrowed non-null.
+    awaitingAnswer: {
+      schemas: { context: chatWithPdfSchemas.context.extend({ questionPage: z.number() }) },
+    },
+    grading: {
+      schemas: { context: chatWithPdfSchemas.context.extend({ questionPage: z.number() }) },
+    },
+    explaining: {
+      schemas: {
+        context: chatWithPdfSchemas.context.extend({
+          questionPage: z.number(),
+          verdict: z.boolean(),
+        }),
+      },
+    },
+  },
+});
+
+/** The one-line verdict shown above the next question. */
+function renderGrade(grade: z.infer<typeof gradeSchema>): string {
+  const verdict = grade.correct ? "Correct" : "Incorrect";
+  // `expected` usually arrives as a full sentence, so joining it with the
+  // sentence-ending period below renders "…set of states..".
+  const expected = grade.expected.trim().replace(/[.!?]+$/, "");
+  // The verdict is rendered here; a model that opens with it anyway would say it twice.
+  const raw = grade.explanation.trim();
+  const stripped = raw.replace(/^(?:in)?correct\b[\s—–:;,.!-]*/i, "");
+  const explanation =
+    stripped === raw ? raw : stripped.replace(/^./, (first) => first.toUpperCase());
+  return `${verdict} — the answer is ${expected}.${explanation ? ` ${explanation}` : ""}`;
+}
+
+/**
+ * The passage the grade was grounded on, quoted in one line with its page.
+ * The learner sees the evidence, not just the verdict: the quoted sentence is
+ * the one that shares the most words with `expected`, else the first.
+ */
+function citeSource(pageNumber: number, sourceText: string, expected = ""): string {
+  const text = sourceText.trim();
+  const sentences = text.split(/(?<=[.!?])\s+/);
+  const words = expected.toLowerCase().match(/[a-z0-9]{3,}/g) ?? [];
+  const overlap = (candidate: string) =>
+    words.filter((word) => candidate.toLowerCase().includes(word)).length;
+  const sentence =
+    sentences.reduce<string | undefined>(
+      (best, candidate) =>
+        best === undefined || overlap(candidate) > overlap(best) ? candidate : best,
+      undefined,
+    ) ?? text;
+  const snippet = sentence.length > 160 ? `${sentence.slice(0, 159)}…` : sentence;
+  return `Source (page ${pageNumber}): "${snippet}"`;
+}
+
+/** Assemble the display text. The page hint comes from the chunk, not the model. */
+function renderQuestion(question: z.infer<typeof questionSchema>, pageNumber: number): string {
+  const choices = question.choices.length
+    ? "\n" + question.choices.map((choice, i) => `${"ABCD"[i]}) ${choice}`).join("\n")
+    : "";
+  return `${question.question}${choices}\n(Hint: see page ${pageNumber})`;
+}
+
+/**
+ * The closing line. A quiz that ends on its budget ends right after grading,
+ * so the last verdict was never shown above a next question: it goes here.
+ */
+function renderScore(context: {
+  documentTitle: string;
+  results: Array<{ correct: boolean }>;
+  question: string;
+  lastGrade: z.infer<typeof gradedAnswerSchema> | null;
+  exhausted: boolean;
+}): string {
+  const correct = context.results.filter((result) => result.correct).length;
+  const score =
+    `You got ${correct} of ${context.results.length} right` +
+    (context.documentTitle ? ` on ${context.documentTitle}.` : ".") +
+    (context.exhausted ? " No fresh pages were left in range." : "");
+  if (context.question !== "" || !context.lastGrade) return score;
+  return `${score}\n\nLast answer: ${renderGrade(context.lastGrade)}`;
+}
+
+const PICKER_PROMPT =
+  "Which document do you want to be quizzed on? " +
+  SAMPLE_LIBRARY.map((entry) => `${entry.title} (${entry.id})`).join(", ");
+
+export const chatWithPdfMachine = agentSetup.createMachine({
+  id: "chat-with-pdf-quiz",
+  context: ({ input }) => ({
+    documentId: input.documentId,
+    documentTitle: SAMPLE_LIBRARY.find((entry) => entry.id === input.documentId)?.title ?? "",
+    topic: input.topic,
+    pageStart: input.pageStart,
+    pageEnd: input.pageEnd,
+    maxQuestions: input.maxQuestions,
+    refreshEvery: input.refreshEvery,
+    batch: [],
+    chunkCursor: 0,
+    pagesCovered: [],
+    questionsAsked: 0,
+    sinceRefresh: 0,
+    question: "",
+    questionPage: null,
+    results: [],
+    answer: "",
+    verdict: null,
+    lastGrade: null,
+    exhausted: false,
+  }),
+  initial: "selectingDocument",
+  states: {
+    /**
+     * "If multiple documents exist, ask the user which one" as a branch, not a
+     * request. A known id goes straight through; a single-document library is
+     * chosen automatically; anything else has to be resolved before retrieval
+     * can run at all.
+     */
+    selectingDocument: {
+      always: ({ context }) => {
+        const named = SAMPLE_LIBRARY.find((entry) => entry.id === context.documentId);
+        if (named) {
+          return { target: "retrieving", context: { documentTitle: named.title } };
+        }
+        if (SAMPLE_LIBRARY.length === 1) {
+          const only = SAMPLE_LIBRARY[0]!;
+          return {
+            target: "retrieving",
+            context: { documentId: only.id, documentTitle: only.title },
+          };
+        }
+        return { target: "choosingDocument" };
+      },
+    },
+
+    // Idle: no invoke, so the run settles here for a host to resume.
+    choosingDocument: {
+      tags: ["waiting"],
+      meta: {
+        interaction: {
+          label: PICKER_PROMPT,
+          events: { SELECT_DOCUMENT: { label: "Choose" } },
+          textEvent: "SELECT_DOCUMENT",
+        },
+      },
+      on: {
+        // An unrecognized choice returns `undefined`: the transition is illegal,
+        // the machine stays put, and no retrieval runs against a guessed id.
+        // Typed chat ("the statecharts one") names the document inside a
+        // sentence, so a choice matches when it contains exactly one id or title.
+        SELECT_DOCUMENT: ({ event }) => {
+          const wanted = event.documentId.trim().toLowerCase();
+          const named = SAMPLE_LIBRARY.filter(
+            (entry) =>
+              wanted.includes(entry.id.toLowerCase()) || wanted.includes(entry.title.toLowerCase()),
+          );
+          const match = named.length === 1 ? named[0] : undefined;
+          return match
+            ? {
+                target: "retrieving",
+                context: { documentId: match.id, documentTitle: match.title },
+              }
+            : undefined;
+        },
+      },
+    },
+
+    retrieving: {
+      invoke: {
+        src: "retrieve",
+        // `documentId` and `excludePages` are threaded by the machine. The model
+        // is never asked to remember either.
+        input: ({ context }) => ({
+          documentId: context.documentId ?? "",
+          topic: context.topic,
+          pageStart: context.pageStart,
+          pageEnd: context.pageEnd,
+          excludePages: context.pagesCovered,
+          limit: context.refreshEvery,
+        }),
+        onDone: ({ output }) =>
+          output.length === 0
+            ? // Nothing fresh left in range. Prose has no answer for this case;
+              // a machine ends the session and says why.
+              { target: "summary", context: { exhausted: true } }
+            : {
+                target: "asking",
+                context: {
+                  batch: output.map((chunk) => chunk.pageNumber),
+                  chunkCursor: 0,
+                  sinceRefresh: 0,
+                },
+              },
+        onError: { target: "summary", context: { exhausted: true } },
+      },
+    },
+
+    /**
+     * One entry, one question. "Ask ONE question at a time" is not an
+     * instruction here — there is no state in which two can be posed.
+     */
+    asking: {
+      invoke: {
+        src: "writeQuestion",
+        input: ({ context }) => ({
+          passage: pageText(context.documentId, context.batch[context.chunkCursor] ?? 0),
+          questionNumber: context.questionsAsked + 1,
+          askedSoFar: context.results.map((result) => result.prompt),
+        }),
+        onDone: ({ context, output }, enq) => {
+          const pageNumber = context.batch[context.chunkCursor]!;
+          const prompt = renderQuestion(output.result, pageNumber);
+          enq.emit({ type: "QUESTION", prompt, pageNumber });
+          return {
+            target: "awaitingAnswer",
+            context: {
+              question: prompt,
+              questionPage: pageNumber,
+              chunkCursor: context.chunkCursor + 1,
+              questionsAsked: context.questionsAsked + 1,
+              sinceRefresh: context.sinceRefresh + 1,
+              pagesCovered: [...context.pagesCovered, pageNumber],
+            },
+          };
+        },
+        onError: { target: "summary" },
+      },
+    },
+
+    awaitingAnswer: {
+      tags: ["waiting"],
+      meta: {
+        interaction: {
+          // The verdict on the previous answer is RENDERED here, above the
+          // question, so a host never jumps to the next one silently. Read it
+          // with `getInteraction(snapshot, { preserveWhitespace: true })`: the
+          // line breaks are the layout.
+          label: ({ context }) =>
+            [
+              context.lastGrade
+                ? `${renderGrade(context.lastGrade)}\n${citeSource(context.lastGrade.pageNumber, context.lastGrade.sourceText, context.lastGrade.expected)}`
+                : "",
+              context.question,
+            ]
+              .filter(Boolean)
+              .join("\n\n"),
+          events: {
+            ANSWER: { label: "Answer", style: "primary" },
+            SKIP: { label: "Skip" },
+            STOP: { label: "End quiz", style: "danger" },
+          },
+          textEvent: "ANSWER",
+        },
+      },
+      on: {
+        ANSWER: ({ event }) => ({ target: "grading", context: { answer: event.text } }),
+        // Skipping goes through the same `continuing` branch grading uses, so
+        // the two paths cannot drift apart.
+        SKIP: { target: "continuing", context: { lastGrade: null } },
+        STOP: { target: "summary" },
+      },
+    },
+
+    // The verdict: one Jev boolean question against the threshold.
+    grading: {
+      invoke: {
+        src: "gradeAnswer",
+        input: ({ context }) => ({
+          prompt: context.question,
+          answer: context.answer,
+          sourceText: pageText(context.documentId, context.questionPage),
+          pageNumber: context.questionPage,
+        }),
+        onDone: ({ output }) => ({
+          target: "explaining",
+          context: { verdict: output.answers.correct.probability >= CORRECT_THRESHOLD },
+        }),
+        onError: {
+          target: "continuing",
+          context: { question: "", questionPage: null, lastGrade: null },
+        },
+      },
+    },
+
+    // The prose around the verdict. Failing to write it still scores the
+    // answer; the next question just has no feedback above it.
+    explaining: {
+      invoke: {
+        src: "explainGrade",
+        input: ({ context }) => ({
+          prompt: context.question,
+          answer: context.answer,
+          sourceText: pageText(context.documentId, context.questionPage),
+          pageNumber: context.questionPage,
+          correct: context.verdict,
+        }),
+        onDone: ({ context, output }, enq) => {
+          const grade = { correct: context.verdict, ...output.result };
+          enq.emit({ type: "GRADED", ...grade });
+          const results = [
+            ...context.results,
+            {
+              pageNumber: context.questionPage,
+              prompt: context.question,
+              answer: context.answer,
+              correct: grade.correct,
+              explanation: grade.explanation,
+            },
+          ];
+          return {
+            target: "continuing",
+            context: {
+              results,
+              question: "",
+              questionPage: null,
+              answer: "",
+              verdict: null,
+              lastGrade: {
+                ...grade,
+                pageNumber: context.questionPage,
+                sourceText: pageText(context.documentId, context.questionPage),
+              },
+            },
+          };
+        },
+        onError: ({ context }) => ({
+          target: "continuing",
+          context: {
+            results: [
+              ...context.results,
+              {
+                pageNumber: context.questionPage,
+                prompt: context.question,
+                answer: context.answer,
+                correct: context.verdict,
+                explanation: "",
+              },
+            ],
+            question: "",
+            questionPage: null,
+            answer: "",
+            verdict: null,
+            lastGrade: null,
+          },
+        }),
+      },
+    },
+
+    /**
+     * The whole quiz loop as ONE visible branch instead of a helper called from
+     * three transitions: budget spent → stop; refresh due or batch drained →
+     * retrieve fresh pages; otherwise → next question from the current batch.
+     */
+    continuing: {
+      type: "choice",
+      choice: ({ context }) => {
+        if (context.questionsAsked >= context.maxQuestions) return { target: "summary" };
+        if (context.sinceRefresh >= context.refreshEvery) return { target: "retrieving" };
+        if (context.chunkCursor >= context.batch.length) return { target: "retrieving" };
+        return { target: "asking" };
+      },
+    },
+
+    summary: {
+      type: "final",
+      output: ({ context }) => ({
+        summary: renderScore(context),
+        documentId: context.documentId ?? "",
+        correct: context.results.filter((result) => result.correct).length,
+        answered: context.results.length,
+        pagesCovered: context.pagesCovered,
+        results: context.results,
+        exhausted: context.exhausted,
+      }),
+    },
+  },
+});
+
+type QuizSnapshot = SnapshotFrom<typeof chatWithPdfMachine>;
+
+/** What a host sends to unblock an idle machine. */
+export type LearnerEvent =
+  | { type: "SELECT_DOCUMENT"; documentId: string }
+  | { type: "ANSWER"; text: string }
+  | { type: "SKIP" }
+  | { type: "STOP" };
+
+/**
+ * Prompt for whatever the idle state is waiting on. `preserveWhitespace`: the
+ * quiz label is deliberately multi-line (verdict, blank line, question).
+ */
+export function idlePrompt(snapshot: QuizSnapshot): string {
+  return getInteraction(snapshot, { preserveWhitespace: true })?.label ?? "?";
+}
+
+/** Route free text to the idle state's `textEvent`. */
+export function toLearnerEvent(snapshot: QuizSnapshot, text: string): LearnerEvent {
+  if (text.toLowerCase() === "stop") return { type: "STOP" };
+  if (text.toLowerCase() === "skip") return { type: "SKIP" };
+  const textEvent = getInteraction(snapshot)?.textEvent ?? "ANSWER";
+  return textEvent === "SELECT_DOCUMENT"
+    ? { type: "SELECT_DOCUMENT", documentId: text }
+    : { type: "ANSWER", text };
+}
+
+export async function main() {
+  const shared = {
+    executors: createAiSdkExecutors(chatWithPdfMachine),
+    on: {
+      QUESTION: ({ prompt }: { prompt: string }) => console.log(`\n${prompt}`),
+      GRADED: (grade: { correct: boolean; expected: string; explanation: string }) =>
+        console.log(`${grade.correct ? "✓" : "✗"} ${renderGrade(grade)}`),
+    },
+    onTransition: (snapshot: QuizSnapshot) =>
+      console.log("[state]", JSON.stringify(snapshot.value)),
+  };
+
+  let result = await runToQuiescence(
+    createAgentRuntime(chatWithPdfMachine, {
+      ...shared,
+    }),
+    {
+      input: { maxQuestions: 6, refreshEvery: 3 },
+      ...shared,
+    },
+  );
+
+  while (result.status === "idle") {
+    const text = await promptLine(`${idlePrompt(result.snapshot)}\n> `);
+    result = await runToQuiescence(
+      createAgentRuntime(chatWithPdfMachine, {
+        ...shared,
+      }),
+      {
+        snapshot: result.persist(),
+        event: toLearnerEvent(result.snapshot, text),
+        ...shared,
+      },
+    );
+  }
+
+  if (result.status !== "done") {
+    throw new Error(`Quiz did not complete: ${result.status}`);
+  }
+
+  console.log(
+    `\nScore: ${result.output.correct}/${result.output.answered} — pages covered: ` +
+      result.output.pagesCovered.join(", ") +
+      (result.output.exhausted ? " (ran out of fresh pages)" : ""),
+  );
+}
+
+/** Prompt once on stdin and resolve the trimmed reply. */
+async function promptLine(query: string): Promise<string> {
+  const { createInterface } = await import("node:readline/promises");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return (await rl.question(query)).trim();
+  } finally {
+    rl.close();
+  }
+}
+
+// Run directly (`tsx index.ts`); skipped when a test imports this module.
+if (import.meta.url === new URL(process.argv[1]!, "file:").href) {
+  if (!process.env.OPENAI_API_KEY || !process.env.TYPESAFE_AI_API_KEY) {
+    console.error("Set OPENAI_API_KEY and TYPESAFE_AI_API_KEY to run this example.");
+    process.exit(1);
+  }
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

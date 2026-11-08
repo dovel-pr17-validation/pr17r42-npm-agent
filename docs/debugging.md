@@ -1,0 +1,29 @@
+# Debugging
+
+Use the XState inspection protocol for framework behavior and Agent traces for request behavior.
+
+```ts no-check
+const result = await runToQuiescence(
+  createAgentRuntime(machine, {
+    executors,
+    inspect: (event) => inspector.next(event),
+    onTrace: (event) => logger.write(serializeTraceEvent(event)),
+  }),
+  { input },
+);
+```
+
+`inspect` is the raw XState stream. `onTrace` adds Agent request start/end/error, chunks, usage, emitted events, transitions, and the terminal run result.
+
+Common errors:
+
+| Error                             | Meaning                                                                                                                               |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| `AgentInvalidEventPayloadError`   | A payload passed to `parseAgentEvent` was not `{ type, ... }`, used a reserved `@agent.*` type, or failed the machine's event schema. |
+| `AgentDecisionExhaustedError`     | Every proposed decision was unknown, invalid, or guard-rejected.                                                                      |
+| `AgentMaxModelCallsExceededError` | The run exceeded its configured model-call budget.                                                                                    |
+| XState version error              | The persisted snapshot version needs the machine's native `migrate` function.                                                         |
+
+An event the active state has no transition for is not an error: the run settles normally and the event comes back as `result.ignored`. Its `machine.transition` trace event carries `ignored: true`.
+
+`lintAgentMachine` reports only Agent-specific mistakes: decisions with no candidate events, decisions that list an event only a person sends, direct object request sources that a host cannot bind, and invokes with no error path. General state-machine lint belongs in XState tooling.

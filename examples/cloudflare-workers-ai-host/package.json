@@ -1,0 +1,23 @@
+{
+  "name": "@statelyai/example-cloudflare-workers-ai-host",
+  "version": "0.0.1-alpha.25",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --port 3010",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@statelyai/agent": "workspace:*",
+    "ai": "^7.0.133",
+    "xstate": "6.0.0-beta.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.4.0",
+    "@cloudflare/workers-types": "^5.20261008.1",
+    "vitest": "^5.0.3",
+    "wrangler": "^4.148.0"
+  }
+}

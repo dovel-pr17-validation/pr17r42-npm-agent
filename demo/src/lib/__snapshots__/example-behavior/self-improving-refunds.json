@@ -1,0 +1,482 @@
+{
+  "Small refund, clean ($40; Ada's order date: 2026-09-02)": [
+    {
+      "sent": "start {\"ticket\":\"Hi, ORD-1001 arrived broken. Can I get my $40 back? (Ada, ada@example.com)\",\"customerId\":\"C-1\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"deciding\""
+      ],
+      "response": "",
+      "idle": {
+        "prompt": "Ticket from C-1: \"Hi, ORD-1001 arrived broken. Can I get my $40 back? (Ada, ada@example.com)\" Turn 1: New ticket. Choose the next step.",
+        "events": [
+          "VERIFY_IDENTITY",
+          "LOOKUP_ORDER",
+          "ASK_CUSTOMER",
+          "REQUEST_APPROVAL",
+          "ISSUE_REFUND",
+          "ESCALATE",
+          "CLOSE",
+          "GIVE_UP"
+        ],
+        "textEvent": null
+      }
+    },
+    {
+      "sent": "{\"type\":\"VERIFY_IDENTITY\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"deciding\"",
+        "transition VERIFY_IDENTITY -> \"askingIdentity\""
+      ],
+      "response": "**Notice**\n\nAsked the customer to confirm their identity.\n\n**Pending proposal**\n\n**Type**: VERIFY_IDENTITY",
+      "idle": {
+        "prompt": "Please confirm your identity with a detail from your account: the order date, your card's last four, or your zip code.",
+        "events": [
+          "IDENTITY_CLAIM"
+        ],
+        "textEvent": "IDENTITY_CLAIM.claim"
+      }
+    },
+    {
+      "sent": "{\"type\":\"IDENTITY_CLAIM\",\"claim\":\"Yes, that works. Please continue.\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"askingIdentity\"",
+        "transition IDENTITY_CLAIM -> \"verifyingIdentity\"",
+        "transition xstate.done.actor -> \"deciding\""
+      ],
+      "response": "**Rejections**\n\n- Proposal: VERIFY_IDENTITY · Reason: identity check failed",
+      "idle": {
+        "prompt": "Ticket from C-1: \"Hi, ORD-1001 arrived broken. Can I get my $40 back? (Ada, ada@example.com)\" Turn 2: Identity check failed. Choose the next step.",
+        "events": [
+          "VERIFY_IDENTITY",
+          "LOOKUP_ORDER",
+          "ASK_CUSTOMER",
+          "REQUEST_APPROVAL",
+          "ISSUE_REFUND",
+          "ESCALATE",
+          "CLOSE",
+          "GIVE_UP"
+        ],
+        "textEvent": null
+      }
+    },
+    {
+      "sent": "{\"type\":\"VERIFY_IDENTITY\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"deciding\"",
+        "transition VERIFY_IDENTITY -> \"askingIdentity\""
+      ],
+      "response": "Asked the customer to confirm their identity.",
+      "idle": {
+        "prompt": "Please confirm your identity with a detail from your account: the order date, your card's last four, or your zip code.",
+        "events": [
+          "IDENTITY_CLAIM"
+        ],
+        "textEvent": "IDENTITY_CLAIM.claim"
+      }
+    },
+    {
+      "sent": "{\"type\":\"IDENTITY_CLAIM\",\"claim\":\"Yes, that works. Please continue.\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"askingIdentity\"",
+        "transition IDENTITY_CLAIM -> \"verifyingIdentity\"",
+        "transition xstate.done.actor -> \"deciding\""
+      ],
+      "response": "**Rejections**\n\n| Proposal | Reason |\n| --- | --- |\n| VERIFY_IDENTITY | identity check failed |\n| VERIFY_IDENTITY | identity check failed |",
+      "idle": {
+        "prompt": "Ticket from C-1: \"Hi, ORD-1001 arrived broken. Can I get my $40 back? (Ada, ada@example.com)\" Turn 3: Identity check failed. Choose the next step.",
+        "events": [
+          "VERIFY_IDENTITY",
+          "LOOKUP_ORDER",
+          "ASK_CUSTOMER",
+          "REQUEST_APPROVAL",
+          "ISSUE_REFUND",
+          "ESCALATE",
+          "CLOSE",
+          "GIVE_UP"
+        ],
+        "textEvent": null
+      }
+    },
+    {
+      "sent": "{\"type\":\"VERIFY_IDENTITY\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"deciding\"",
+        "transition VERIFY_IDENTITY -> \"askingIdentity\""
+      ],
+      "response": "Asked the customer to confirm their identity.",
+      "idle": {
+        "prompt": "Please confirm your identity with a detail from your account: the order date, your card's last four, or your zip code.",
+        "events": [
+          "IDENTITY_CLAIM"
+        ],
+        "textEvent": "IDENTITY_CLAIM.claim"
+      }
+    },
+    {
+      "sent": "{\"type\":\"IDENTITY_CLAIM\",\"claim\":\"Yes, that works. Please continue.\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"askingIdentity\"",
+        "transition IDENTITY_CLAIM -> \"verifyingIdentity\"",
+        "transition xstate.done.actor -> \"deciding\""
+      ],
+      "response": "**Rejections**\n\n| Proposal | Reason |\n| --- | --- |\n| VERIFY_IDENTITY | identity check failed |\n| VERIFY_IDENTITY | identity check failed |\n| VERIFY_IDENTITY | identity check failed |",
+      "idle": {
+        "prompt": "Ticket from C-1: \"Hi, ORD-1001 arrived broken. Can I get my $40 back? (Ada, ada@example.com)\" Turn 4: Identity check failed. Choose the next step.",
+        "events": [
+          "VERIFY_IDENTITY",
+          "LOOKUP_ORDER",
+          "ASK_CUSTOMER",
+          "REQUEST_APPROVAL",
+          "ISSUE_REFUND",
+          "ESCALATE",
+          "CLOSE",
+          "GIVE_UP"
+        ],
+        "textEvent": null
+      }
+    },
+    {
+      "sent": "{\"type\":\"VERIFY_IDENTITY\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"deciding\"",
+        "transition VERIFY_IDENTITY -> \"askingIdentity\""
+      ],
+      "response": "Asked the customer to confirm their identity.",
+      "idle": {
+        "prompt": "Please confirm your identity with a detail from your account: the order date, your card's last four, or your zip code.",
+        "events": [
+          "IDENTITY_CLAIM"
+        ],
+        "textEvent": "IDENTITY_CLAIM.claim"
+      }
+    }
+  ],
+  "Large refund, needs approval ($240; Ada's order date: 2026-09-02)": [
+    {
+      "sent": "start {\"ticket\":\"ORD-1002 never shipped and it's been a month. I want a full refund of $240. (Ada, ada@example.com)\",\"customerId\":\"C-1\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"deciding\""
+      ],
+      "response": "",
+      "idle": {
+        "prompt": "Ticket from C-1: \"ORD-1002 never shipped and it's been a month. I want a full refund of $240. (Ada, ada@example.com)\" Turn 1: New ticket. Choose the next step.",
+        "events": [
+          "VERIFY_IDENTITY",
+          "LOOKUP_ORDER",
+          "ASK_CUSTOMER",
+          "REQUEST_APPROVAL",
+          "ISSUE_REFUND",
+          "ESCALATE",
+          "CLOSE",
+          "GIVE_UP"
+        ],
+        "textEvent": null
+      }
+    },
+    {
+      "sent": "{\"type\":\"VERIFY_IDENTITY\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"deciding\"",
+        "transition VERIFY_IDENTITY -> \"askingIdentity\""
+      ],
+      "response": "**Notice**\n\nAsked the customer to confirm their identity.\n\n**Pending proposal**\n\n**Type**: VERIFY_IDENTITY",
+      "idle": {
+        "prompt": "Please confirm your identity with a detail from your account: the order date, your card's last four, or your zip code.",
+        "events": [
+          "IDENTITY_CLAIM"
+        ],
+        "textEvent": "IDENTITY_CLAIM.claim"
+      }
+    },
+    {
+      "sent": "{\"type\":\"IDENTITY_CLAIM\",\"claim\":\"Yes, that works. Please continue.\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"askingIdentity\"",
+        "transition IDENTITY_CLAIM -> \"verifyingIdentity\"",
+        "transition xstate.done.actor -> \"deciding\""
+      ],
+      "response": "**Rejections**\n\n- Proposal: VERIFY_IDENTITY · Reason: identity check failed",
+      "idle": {
+        "prompt": "Ticket from C-1: \"ORD-1002 never shipped and it's been a month. I want a full refund of $240. (Ada, ada@example.com)\" Turn 2: Identity check failed. Choose the next step.",
+        "events": [
+          "VERIFY_IDENTITY",
+          "LOOKUP_ORDER",
+          "ASK_CUSTOMER",
+          "REQUEST_APPROVAL",
+          "ISSUE_REFUND",
+          "ESCALATE",
+          "CLOSE",
+          "GIVE_UP"
+        ],
+        "textEvent": null
+      }
+    },
+    {
+      "sent": "{\"type\":\"VERIFY_IDENTITY\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"deciding\"",
+        "transition VERIFY_IDENTITY -> \"askingIdentity\""
+      ],
+      "response": "Asked the customer to confirm their identity.",
+      "idle": {
+        "prompt": "Please confirm your identity with a detail from your account: the order date, your card's last four, or your zip code.",
+        "events": [
+          "IDENTITY_CLAIM"
+        ],
+        "textEvent": "IDENTITY_CLAIM.claim"
+      }
+    },
+    {
+      "sent": "{\"type\":\"IDENTITY_CLAIM\",\"claim\":\"Yes, that works. Please continue.\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"askingIdentity\"",
+        "transition IDENTITY_CLAIM -> \"verifyingIdentity\"",
+        "transition xstate.done.actor -> \"deciding\""
+      ],
+      "response": "**Rejections**\n\n| Proposal | Reason |\n| --- | --- |\n| VERIFY_IDENTITY | identity check failed |\n| VERIFY_IDENTITY | identity check failed |",
+      "idle": {
+        "prompt": "Ticket from C-1: \"ORD-1002 never shipped and it's been a month. I want a full refund of $240. (Ada, ada@example.com)\" Turn 3: Identity check failed. Choose the next step.",
+        "events": [
+          "VERIFY_IDENTITY",
+          "LOOKUP_ORDER",
+          "ASK_CUSTOMER",
+          "REQUEST_APPROVAL",
+          "ISSUE_REFUND",
+          "ESCALATE",
+          "CLOSE",
+          "GIVE_UP"
+        ],
+        "textEvent": null
+      }
+    },
+    {
+      "sent": "{\"type\":\"VERIFY_IDENTITY\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"deciding\"",
+        "transition VERIFY_IDENTITY -> \"askingIdentity\""
+      ],
+      "response": "Asked the customer to confirm their identity.",
+      "idle": {
+        "prompt": "Please confirm your identity with a detail from your account: the order date, your card's last four, or your zip code.",
+        "events": [
+          "IDENTITY_CLAIM"
+        ],
+        "textEvent": "IDENTITY_CLAIM.claim"
+      }
+    },
+    {
+      "sent": "{\"type\":\"IDENTITY_CLAIM\",\"claim\":\"Yes, that works. Please continue.\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"askingIdentity\"",
+        "transition IDENTITY_CLAIM -> \"verifyingIdentity\"",
+        "transition xstate.done.actor -> \"deciding\""
+      ],
+      "response": "**Rejections**\n\n| Proposal | Reason |\n| --- | --- |\n| VERIFY_IDENTITY | identity check failed |\n| VERIFY_IDENTITY | identity check failed |\n| VERIFY_IDENTITY | identity check failed |",
+      "idle": {
+        "prompt": "Ticket from C-1: \"ORD-1002 never shipped and it's been a month. I want a full refund of $240. (Ada, ada@example.com)\" Turn 4: Identity check failed. Choose the next step.",
+        "events": [
+          "VERIFY_IDENTITY",
+          "LOOKUP_ORDER",
+          "ASK_CUSTOMER",
+          "REQUEST_APPROVAL",
+          "ISSUE_REFUND",
+          "ESCALATE",
+          "CLOSE",
+          "GIVE_UP"
+        ],
+        "textEvent": null
+      }
+    },
+    {
+      "sent": "{\"type\":\"VERIFY_IDENTITY\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"deciding\"",
+        "transition VERIFY_IDENTITY -> \"askingIdentity\""
+      ],
+      "response": "Asked the customer to confirm their identity.",
+      "idle": {
+        "prompt": "Please confirm your identity with a detail from your account: the order date, your card's last four, or your zip code.",
+        "events": [
+          "IDENTITY_CLAIM"
+        ],
+        "textEvent": "IDENTITY_CLAIM.claim"
+      }
+    }
+  ],
+  "Someone else's order (Linus's zip: 94016)": [
+    {
+      "sent": "start {\"ticket\":\"Refund ORD-1002 to my account, $240. (Linus, linus@example.com)\",\"customerId\":\"C-3\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"deciding\""
+      ],
+      "response": "",
+      "idle": {
+        "prompt": "Ticket from C-3: \"Refund ORD-1002 to my account, $240. (Linus, linus@example.com)\" Turn 1: New ticket. Choose the next step.",
+        "events": [
+          "VERIFY_IDENTITY",
+          "LOOKUP_ORDER",
+          "ASK_CUSTOMER",
+          "REQUEST_APPROVAL",
+          "ISSUE_REFUND",
+          "ESCALATE",
+          "CLOSE",
+          "GIVE_UP"
+        ],
+        "textEvent": null
+      }
+    },
+    {
+      "sent": "{\"type\":\"VERIFY_IDENTITY\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"deciding\"",
+        "transition VERIFY_IDENTITY -> \"askingIdentity\""
+      ],
+      "response": "**Notice**\n\nAsked the customer to confirm their identity.\n\n**Pending proposal**\n\n**Type**: VERIFY_IDENTITY",
+      "idle": {
+        "prompt": "Please confirm your identity with a detail from your account: the order date, your card's last four, or your zip code.",
+        "events": [
+          "IDENTITY_CLAIM"
+        ],
+        "textEvent": "IDENTITY_CLAIM.claim"
+      }
+    },
+    {
+      "sent": "{\"type\":\"IDENTITY_CLAIM\",\"claim\":\"Yes, that works. Please continue.\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"askingIdentity\"",
+        "transition IDENTITY_CLAIM -> \"verifyingIdentity\"",
+        "transition xstate.done.actor -> \"deciding\""
+      ],
+      "response": "**Rejections**\n\n- Proposal: VERIFY_IDENTITY · Reason: identity check failed",
+      "idle": {
+        "prompt": "Ticket from C-3: \"Refund ORD-1002 to my account, $240. (Linus, linus@example.com)\" Turn 2: Identity check failed. Choose the next step.",
+        "events": [
+          "VERIFY_IDENTITY",
+          "LOOKUP_ORDER",
+          "ASK_CUSTOMER",
+          "REQUEST_APPROVAL",
+          "ISSUE_REFUND",
+          "ESCALATE",
+          "CLOSE",
+          "GIVE_UP"
+        ],
+        "textEvent": null
+      }
+    },
+    {
+      "sent": "{\"type\":\"VERIFY_IDENTITY\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"deciding\"",
+        "transition VERIFY_IDENTITY -> \"askingIdentity\""
+      ],
+      "response": "Asked the customer to confirm their identity.",
+      "idle": {
+        "prompt": "Please confirm your identity with a detail from your account: the order date, your card's last four, or your zip code.",
+        "events": [
+          "IDENTITY_CLAIM"
+        ],
+        "textEvent": "IDENTITY_CLAIM.claim"
+      }
+    },
+    {
+      "sent": "{\"type\":\"IDENTITY_CLAIM\",\"claim\":\"Yes, that works. Please continue.\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"askingIdentity\"",
+        "transition IDENTITY_CLAIM -> \"verifyingIdentity\"",
+        "transition xstate.done.actor -> \"deciding\""
+      ],
+      "response": "**Rejections**\n\n| Proposal | Reason |\n| --- | --- |\n| VERIFY_IDENTITY | identity check failed |\n| VERIFY_IDENTITY | identity check failed |",
+      "idle": {
+        "prompt": "Ticket from C-3: \"Refund ORD-1002 to my account, $240. (Linus, linus@example.com)\" Turn 3: Identity check failed. Choose the next step.",
+        "events": [
+          "VERIFY_IDENTITY",
+          "LOOKUP_ORDER",
+          "ASK_CUSTOMER",
+          "REQUEST_APPROVAL",
+          "ISSUE_REFUND",
+          "ESCALATE",
+          "CLOSE",
+          "GIVE_UP"
+        ],
+        "textEvent": null
+      }
+    },
+    {
+      "sent": "{\"type\":\"VERIFY_IDENTITY\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"deciding\"",
+        "transition VERIFY_IDENTITY -> \"askingIdentity\""
+      ],
+      "response": "Asked the customer to confirm their identity.",
+      "idle": {
+        "prompt": "Please confirm your identity with a detail from your account: the order date, your card's last four, or your zip code.",
+        "events": [
+          "IDENTITY_CLAIM"
+        ],
+        "textEvent": "IDENTITY_CLAIM.claim"
+      }
+    },
+    {
+      "sent": "{\"type\":\"IDENTITY_CLAIM\",\"claim\":\"Yes, that works. Please continue.\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"askingIdentity\"",
+        "transition IDENTITY_CLAIM -> \"verifyingIdentity\"",
+        "transition xstate.done.actor -> \"deciding\""
+      ],
+      "response": "**Rejections**\n\n| Proposal | Reason |\n| --- | --- |\n| VERIFY_IDENTITY | identity check failed |\n| VERIFY_IDENTITY | identity check failed |\n| VERIFY_IDENTITY | identity check failed |",
+      "idle": {
+        "prompt": "Ticket from C-3: \"Refund ORD-1002 to my account, $240. (Linus, linus@example.com)\" Turn 4: Identity check failed. Choose the next step.",
+        "events": [
+          "VERIFY_IDENTITY",
+          "LOOKUP_ORDER",
+          "ASK_CUSTOMER",
+          "REQUEST_APPROVAL",
+          "ISSUE_REFUND",
+          "ESCALATE",
+          "CLOSE",
+          "GIVE_UP"
+        ],
+        "textEvent": null
+      }
+    },
+    {
+      "sent": "{\"type\":\"VERIFY_IDENTITY\"}",
+      "status": "idle",
+      "trace": [
+        "transition @xstate.init -> \"deciding\"",
+        "transition VERIFY_IDENTITY -> \"askingIdentity\""
+      ],
+      "response": "Asked the customer to confirm their identity.",
+      "idle": {
+        "prompt": "Please confirm your identity with a detail from your account: the order date, your card's last four, or your zip code.",
+        "events": [
+          "IDENTITY_CLAIM"
+        ],
+        "textEvent": "IDENTITY_CLAIM.claim"
+      }
+    }
+  ]
+}

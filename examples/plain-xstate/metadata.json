@@ -1,0 +1,20 @@
+{
+  "name": "plain-xstate",
+  "title": "Launch blurb writer (plain XState)",
+  "kind": "agent-workflow",
+  "machine": "plainWriterAgentMachine",
+  "origin": {
+    "type": "stately-agent",
+    "source": "New example for driving a library-unaware XState v6 machine",
+    "url": null
+  },
+  "comparison": {
+    "targets": ["LangGraph", "hand-rolled loop"],
+    "purpose": "Writes and revises a product launch blurb with an ordinary XState machine that knows nothing about the agent library. The runtime binds its draft step to a model, you approve or revise, and the machine's own guard stops REVISE after two rounds."
+  },
+  "starters": [
+    "a CLI that turns shell history into a changelog",
+    "a solar-powered backyard weather station",
+    "a note app that deletes anything you have not opened in a year"
+  ]
+}

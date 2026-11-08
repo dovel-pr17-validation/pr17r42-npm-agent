@@ -1,0 +1,35 @@
+{
+  "name": "river-crossing",
+  "title": "River crossing puzzle",
+  "kind": "agent-workflow",
+  "machine": "riverCrossingMachine",
+  "origin": {
+    "type": "stately-agent",
+    "source": "Ported in spirit from the v1 examples (river-crossing.ts on the next branch)",
+    "url": null
+  },
+  "comparison": {
+    "targets": ["LangGraph", "Burr"],
+    "purpose": "The machine is ground truth for a constraint puzzle: the model only proposes crossings and guards reject illegal ones. Instead of searching itself, the model can send REQUEST_PLAN and the machine solves itself by graph traversal over the same guards. A move budget ends the run in failed when it runs out, and the run narrates every move bank by bank."
+  },
+  "starters": [
+    {
+      "label": "Solve (max 12 moves)",
+      "input": {
+        "maxMoves": 12
+      }
+    },
+    {
+      "label": "Tight budget (max 7 moves)",
+      "input": {
+        "maxMoves": 7
+      }
+    },
+    {
+      "label": "Watch it fail (max 4 moves)",
+      "input": {
+        "maxMoves": 4
+      }
+    }
+  ]
+}

@@ -1,0 +1,121 @@
+# Quickstart
+
+Install core:
+
+```sh
+pnpm add @statelyai/agent@alpha xstate@6.0.0-beta.0 zod
+```
+
+XState is pinned to the exact version the package's peer dependency names, because its experimental durable restoration API (`xstate/durable`) can still change between prereleases. `xstate@beta` can resolve to a newer prerelease that the package does not support.
+
+Add `ai` and a provider only when using the optional AI SDK adapter.
+
+## Define and run one artifact
+
+Save this as `agent.mts`. It uses a deterministic executor, so it needs no API
+key or model SDK.
+
+```ts
+import { z } from "zod";
+import { runAgent, setupAgent } from "@statelyai/agent";
+
+const answerOutputSchema = z.object({ answer: z.string() });
+
+const agent = setupAgent({
+  context: z.object({ prompt: z.string(), answer: z.string().nullable() }),
+  input: z.object({ prompt: z.string() }),
+  output: answerOutputSchema,
+  requests: {
+    answer: {
+      model: "fast",
+      schemas: { input: z.object({ prompt: z.string() }), output: z.string() },
+      prompt: ({ input }) => input.prompt,
+    },
+  },
+});
+
+const machine = agent.createMachine({
+  context: ({ input }) => ({ prompt: input.prompt, answer: null }),
+  initial: "answering",
+  states: {
+    answering: {
+      invoke: {
+        src: "answer",
+        input: ({ context }) => ({ prompt: context.prompt }),
+        onDone: ({ output }) => ({
+          target: "done",
+          context: { answer: output.result },
+        }),
+      },
+    },
+    done: {
+      type: "final",
+      output: ({ context }) => ({ answer: context.answer ?? "" }),
+    },
+  },
+});
+
+const result = await runAgent(machine, {
+  input: { prompt: "Why state machines?" },
+  executors: {
+    generateText: async () => ({ result: "Because transitions constrain behavior." }),
+  },
+});
+
+if (result.status !== "done") {
+  throw new Error(`Unexpected status: ${result.status}`);
+}
+
+console.log(result.output.answer);
+```
+
+Run it:
+
+```sh
+npx tsx agent.mts
+```
+
+It prints:
+
+```text
+Because transitions constrain behavior.
+```
+
+Requests have a semantic `name`, resolved `input`, model reference, schemas,
+prompt/messages, and tools. The machine owns control flow; the executor owns
+the provider call.
+
+An executor is just a function, so the machine runs anywhere a function does.
+When several requests each need their own canned answer, the executor routes on
+`request.name`. See [Evals](evals.md#testing-without-a-provider).
+
+## Use a real model
+
+Leave the states unchanged. Declare the model once by adding `models` to the
+`setupAgent` call, then hand the machine to the AI SDK adapter, which reads
+those models:
+
+```ts
+import { openai } from "@ai-sdk/openai";
+import { createAiSdkExecutors } from "@statelyai/agent/ai-sdk";
+
+// In the setupAgent({ ... }) call above:
+//   models: { fast: openai("gpt-6-luna") },
+
+const liveResult = await runAgent(machine, {
+  input: { prompt: "Why state machines?" },
+  executors: createAiSdkExecutors(machine),
+});
+
+if (liveResult.status === "done") {
+  console.log(liveResult.output);
+}
+```
+
+A host that owns its own model map passes it instead:
+`createAiSdkExecutors({ models: { fast: openai("gpt-6-luna") } })`.
+
+Continue with [Choosing a run mode](choosing-a-run-mode.md),
+[Messages](messages.md), and [Persistence](persistence.md). A host that drives
+the transition loop itself uses `createAgentRuntime`; see
+[Write your own host loop](hosts.md#write-your-own-host-loop).

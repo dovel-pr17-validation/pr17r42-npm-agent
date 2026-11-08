@@ -1,0 +1,20 @@
+{
+  "name": "deep-research",
+  "title": "Research a question and write a sourced report",
+  "kind": "agent-workflow",
+  "origin": {
+    "type": "langgraph",
+    "source": "Open Deep Research and Gemini Fullstack LangGraph research loops",
+    "url": "https://github.com/langchain-ai/open_deep_research"
+  },
+  "comparison": {
+    "targets": ["Open Deep Research", "Gemini Fullstack LangGraph", "local-deep-researcher"],
+    "purpose": "Plans several complementary searches and runs them at the same time; then Jev judges whether the findings answer the question, and a choice state either writes the report (sufficient) or spends the one follow-up round the budget allows, aimed at what the findings leave out. The output says which rule ended it. Researchers run real web search, and a cited page enters the source ledger only if the search actually returned it."
+  },
+  "starters": [
+    "What are the leading approaches to long-context LLMs in 2026?",
+    "How do carbon-capture startups actually remove CO2?",
+    "What is the state of solid-state batteries for EVs?"
+  ],
+  "budgetMs": 300000
+}

@@ -1,0 +1,21 @@
+{
+  "name": "snapshot-migration",
+  "title": "Resume a run after shipping a new machine",
+  "kind": "pattern",
+  "machine": "orderApprovalMachine",
+  "origin": {
+    "type": "stately-agent",
+    "source": "Native XState versioned snapshots and machine-level migrate across two versions of one order-approval machine",
+    "url": null
+  },
+  "comparison": {
+    "targets": ["LangGraph checkpointer"],
+    "purpose": "A paused run resumed after deployment follows XState's native version and migrate contract instead of an Agent-specific snapshot adapter."
+  },
+  "runners": [
+    {
+      "label": "Pause on v1, ship v2, resume the snapshot",
+      "export": "runSnapshotMigrationExample"
+    }
+  ]
+}

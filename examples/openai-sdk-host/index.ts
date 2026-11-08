@@ -1,0 +1,152 @@
+/**
+ * Raw `openai` npm package host for XState agent machines.
+ *
+ * The mapping itself now ships in the package as
+ * `@statelyai/agent/openai` — `createOpenAiExecutors` implements the
+ * framework's `{ generateText, streamText, decide }` executor contract
+ * directly against the raw `openai` package, with no Vercel AI SDK in
+ * between. Calls with function tools (`decide`, and `generateText` with
+ * tools) use the Responses API, which reasoning models require for tools;
+ * tool-free calls use Chat Completions. Proof that the executor contract is "three
+ * plain functions," not an AI-SDK-specific shape. Compare
+ * `@statelyai/agent/ai-sdk` (same contract, mapped through the AI SDK).
+ *
+ * What is left here is the host: which model ids the demo machines' model
+ * refs resolve to, and three runnable demos over them.
+ *
+ * Every executor the adapter builds reports token `usage`, mapped from
+ * OpenAI's snake_case `response.usage` onto the framework's `AgentCallUsage`,
+ * so `runAgent`'s run-level budget and the usage event log are populated by a
+ * raw-SDK host too. Streaming asks for it explicitly with
+ * `stream_options.include_usage`.
+ *
+ * The adapter's `streamText` is deliberately TEXT-ONLY: it sends no tools and
+ * no `response_format`, because a chunk-by-chunk structured object has
+ * nothing useful to hand `onChunk` mid-stream. A request that declares tools
+ * or a structured output schema is rejected with a message pointing at
+ * `generateText`, rather than silently returning unstructured text.
+ *
+ * Run: OPENAI_API_KEY=... npx tsx examples/openai-sdk-host/index.ts
+ */
+import type OpenAI from "openai";
+import type { SnapshotFrom } from "xstate";
+import { createAgentRuntime, runToQuiescence } from "@statelyai/agent";
+import { createOpenAiExecutors } from "@statelyai/agent/openai";
+import { triageMachine } from "../triage/index.js";
+import { idlePrompt, toPlayerEvent, twentyQuestionsMachine } from "../twenty-questions/index.js";
+
+async function promptAnswer(question: string): Promise<string> {
+  const { createInterface } = await import("node:readline/promises");
+  const rl = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return await rl.question(`${question} `);
+  } finally {
+    rl.close();
+  }
+}
+
+// The demo machines (triage, twenty-questions) carry model refs that both map
+// to one real OpenAI id — a raw-SDK host resolves them itself.
+const resolveDemoModel = () => "gpt-6-luna";
+
+export async function runTriageDemo(client: OpenAI, ticket: string) {
+  const { generateText } = createOpenAiExecutors({ client, resolveModel: resolveDemoModel });
+  const result = await runToQuiescence(
+    createAgentRuntime(triageMachine, {
+      executors: { generateText },
+      onTransition: (snapshot) => console.log("[state]", JSON.stringify(snapshot.value)),
+    }),
+    {
+      input: { ticket },
+    },
+  );
+  if (result.status !== "done") {
+    throw new Error(`Triage demo did not complete: ${result.status}`);
+  }
+  return result.output;
+}
+
+export async function runStreamingDemo(client: OpenAI) {
+  const { streamText } = createOpenAiExecutors({ client });
+  let text = "";
+  await streamText(
+    {
+      name: "streamingDemo",
+      model: "gpt-6-luna",
+      system: "You tell short, punchy jokes.",
+      prompt: "Tell a joke about state machines.",
+      tools: {},
+    },
+    { onChunk: (chunk) => (text += chunk) },
+  );
+  return text;
+}
+
+// Drives twenty-questions' inline `agent.decide` + machine-owned human-input
+// states: every player turn settles the run idle, and the host resumes it
+// from the persisted snapshot with the player's event — the same loop
+// twenty-questions/index.ts's own main() runs.
+export async function runTwentyQuestionsDemo(client: OpenAI) {
+  const { generateText, decide } = createOpenAiExecutors({
+    client,
+    resolveModel: resolveDemoModel,
+  });
+
+  const executors = { generateText, decide };
+  const onTransition = (snapshot: SnapshotFrom<typeof twentyQuestionsMachine>) =>
+    console.log("[state]", JSON.stringify(snapshot.value));
+  let result = await runToQuiescence(
+    createAgentRuntime(twentyQuestionsMachine, {
+      executors,
+      onTransition,
+    }),
+    {
+      input: { questionsRemaining: 20 },
+    },
+  );
+  // Every player turn settles the run idle; resume from the persisted snapshot.
+  while (result.status === "idle") {
+    const text = await promptAnswer(`${idlePrompt(result.snapshot)}\n> `);
+    result = await runToQuiescence(
+      createAgentRuntime(twentyQuestionsMachine, {
+        executors,
+        onTransition,
+      }),
+      {
+        snapshot: result.persist(),
+        event: toPlayerEvent(result.snapshot, text),
+      },
+    );
+  }
+  if (result.status !== "done") {
+    throw new Error(`Twenty questions demo did not complete: ${result.status}`);
+  }
+  return result.output;
+}
+
+async function main() {
+  const { default: OpenAIClient } = await import("openai");
+  const client = new OpenAIClient();
+
+  console.log("— generateText (structured output via response_format) —");
+  console.log(await runTriageDemo(client, "My invoice is wrong and I am furious."));
+
+  console.log("— streamText (live chunks) —");
+  console.log(await runStreamingDemo(client));
+
+  console.log("— decide (tool_choice: required) —");
+  const result = await runTwentyQuestionsDemo(client);
+  console.log(`Final score — user: ${result.userScore}, agent: ${result.agentScore}`);
+}
+
+// Run directly (`tsx index.ts`); skipped when a test imports this module.
+if (import.meta.url === new URL(process.argv[1]!, "file:").href) {
+  if (!process.env.OPENAI_API_KEY) {
+    console.error("Set OPENAI_API_KEY to run this example.");
+    process.exit(1);
+  }
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

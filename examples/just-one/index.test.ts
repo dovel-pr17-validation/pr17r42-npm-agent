@@ -1,0 +1,376 @@
+import { describe, expect, test } from "vitest";
+import { z } from "zod";
+import {
+  getInteraction,
+  getStatePath,
+  createAgentRuntime,
+  runToQuiescence,
+} from "@statelyai/agent";
+import type { AgentRequestExecutor } from "@statelyai/agent";
+import {
+  type GuesserEvent,
+  idlePrompt,
+  isCorrectGuess,
+  judgeClues,
+  justOneMachine,
+  PERSONAS,
+} from "./index.js";
+
+/** The `writeClue` request input, as the executor receives it. */
+const clueRequestInput = z.object({
+  secretWord: z.string(),
+  persona: z.object({ name: z.string() }),
+});
+
+/** The log lines of the output's narration (headline, blank line, then one line each). */
+const logOf = (output: { summary: string }) => output.summary.split("\n").slice(2);
+
+/** Every request the scripted clue-giver saw, as the executor received it. */
+interface CapturedRequest {
+  name?: string;
+  system?: string;
+  prompt?: string;
+  serialized: string;
+}
+
+/**
+ * Scripted clue-givers: one clue per persona, per round. The executor routes on
+ * `request.name` and then on the structured `request.input.persona` — the three
+ * regions share one request definition, so the persona in the validated input
+ * is what tells them apart. Nothing here reads the prompt text.
+ */
+function createClueGivers(script: Record<string, string[]>, captured: CapturedRequest[] = []) {
+  const counts = new Map<string, number>();
+  const executor: AgentRequestExecutor = async (request) => {
+    captured.push({
+      name: request.name,
+      system: request.system,
+      prompt: request.prompt,
+      serialized: JSON.stringify(request),
+    });
+    if (request.name !== "writeClue") {
+      throw new Error(`unexpected request: ${request.name ?? "(unnamed)"}`);
+    }
+    const { persona } = clueRequestInput.parse(request.input);
+    const round = counts.get(persona.name) ?? 0;
+    counts.set(persona.name, round + 1);
+    const clue = script[persona.name]?.[round] ?? "";
+    const { secretWord } = clueRequestInput.parse(request.input);
+    // A chatty model that explains itself anyway: its reasoning names the secret.
+    return {
+      result: { clue, reasoning: `${persona.name} avoids the obvious clue for ${secretWord}` },
+    };
+  };
+  return { executor, captured };
+}
+
+interface PlayOptions {
+  input: { rounds: number; deck?: string[] };
+  script: Record<string, string[]>;
+  /** Consumed in order on each idle settle. */
+  guesserEvents: GuesserEvent[];
+  captured?: CapturedRequest[];
+}
+
+/** Drives the machine through its idle-resume loop, recording each idle prompt. */
+async function play(options: PlayOptions) {
+  const queued = [...options.guesserEvents];
+  const prompts: string[] = [];
+  const { executor } = createClueGivers(options.script, options.captured);
+  const shared = { executors: { generateText: executor } };
+
+  let result = await runToQuiescence(
+    createAgentRuntime(justOneMachine, {
+      ...shared,
+    }),
+    {
+      input: options.input,
+      ...shared,
+    },
+  );
+
+  while (result.status === "idle") {
+    // Every idle state must advertise how a host can unblock it.
+    const interaction = getInteraction(result.snapshot);
+    expect(interaction, `no interaction meta on ${getStatePath(result.snapshot)}`).toBeDefined();
+    expect(interaction?.textEvent).toBe("GUESS");
+    prompts.push(idlePrompt(result.snapshot));
+
+    const event = queued.shift();
+    if (!event) throw new Error(`ran out of guesser events at: ${prompts.at(-1)}`);
+    expect(result.snapshot.can(event)).toBe(true);
+
+    result = await runToQuiescence(
+      createAgentRuntime(justOneMachine, {
+        ...shared,
+      }),
+      {
+        snapshot: result.persist(),
+        event,
+        ...shared,
+      },
+    );
+  }
+
+  if (result.status !== "done") throw new Error(`expected done, got ${result.status}`);
+  return { result, prompts };
+}
+
+describe("just-one", () => {
+  test("colliding clues cancel each other before the guesser sees them", async () => {
+    const { result, prompts } = await play({
+      input: { rounds: 1, deck: ["volcano"] },
+      script: { Iris: ["lava"], Milo: ["lava"], Nadia: ["eruption"] },
+      guesserEvents: [{ type: "GUESS", guess: "volcano" }],
+    });
+
+    // Only the surviving clue reaches the guesser.
+    expect(prompts).toEqual(["Clues: eruption. What is the secret word?"]);
+    expect(result.output.score).toBe(1);
+    expect(logOf(result.output)).toEqual([
+      'Round 1 — secret "volcano". Clues: [Iris: duplicate — cancelled], ' +
+        "[Milo: duplicate — cancelled], eruption (Nadia).",
+      'Guessed "volcano" — correct.',
+    ]);
+  });
+
+  test("a round where every clue is struck is skipped without a guessing turn", async () => {
+    const captured: CapturedRequest[] = [];
+    const { executor } = createClueGivers(
+      { Iris: ["magma"], Milo: ["magma"], Nadia: ["magma"] },
+      captured,
+    );
+
+    const result = await runToQuiescence(
+      createAgentRuntime(justOneMachine, {
+        executors: { generateText: executor },
+      }),
+      {
+        input: { rounds: 1, deck: ["volcano"] },
+      },
+    );
+
+    // The run never settles idle: `judging` goes straight to `roundEnd`.
+    expect(result.status).toBe("done");
+    if (result.status !== "done") throw new Error("expected done");
+    expect(result.output.score).toBe(0);
+    expect(logOf(result.output).at(-1)).toBe("All clues cancelled — round skipped.");
+    expect(result.output.summary).toContain("Guessed 0 of 1 word.");
+    expect(captured).toHaveLength(3);
+  });
+
+  test("a clue equal to (or containing) the secret word is struck", async () => {
+    const { result, prompts } = await play({
+      input: { rounds: 1, deck: ["piano"] },
+      // Iris writes the secret word; Milo writes an inflected form of it.
+      script: { Iris: ["Piano"], Milo: ["pianos"], Nadia: ["keys"] },
+      guesserEvents: [{ type: "GUESS", guess: "piano" }],
+    });
+
+    expect(prompts).toEqual(["Clues: keys. What is the secret word?"]);
+    expect(logOf(result.output)[0]).toBe(
+      'Round 1 — secret "piano". Clues: [Iris: gives away the secret word], ' +
+        "[Milo: gives away the secret word], keys (Nadia).",
+    );
+    expect(result.output.score).toBe(1);
+  });
+
+  test("nothing a host can render while the guesser thinks gives the word away", async () => {
+    // Iris's clue IS the secret, and every draft's reasoning names it — the
+    // worst case for a leak. Each idle snapshot is checked the way a host would
+    // read it: the interaction label and every context field — the deck
+    // included, since it is kept face down.
+    const deck = ["piano", "volcano"];
+    const { executor } = createClueGivers({
+      Iris: ["piano", "lava"],
+      Milo: ["keys", "crater"],
+      Nadia: ["Mozart", "Vesuvius"],
+    });
+    const shared = { executors: { generateText: executor } };
+
+    let result = await runToQuiescence(createAgentRuntime(justOneMachine, shared), {
+      input: { rounds: 2, deck },
+      ...shared,
+    });
+    for (const secret of deck) {
+      expect(result.status).toBe("idle");
+      if (result.status !== "idle") throw new Error("expected idle");
+      const shown = JSON.stringify([
+        idlePrompt(result.snapshot),
+        result.snapshot.context,
+        result.persist(),
+      ]).toLowerCase();
+      expect(shown, `leaked "${secret}": ${shown}`).not.toContain(secret);
+
+      result = await runToQuiescence(createAgentRuntime(justOneMachine, shared), {
+        snapshot: result.persist(),
+        event: { type: "GUESS", guess: "no idea" },
+        ...shared,
+      });
+    }
+
+    // Revealed once the guess is in.
+    if (result.status !== "done") throw new Error("expected done");
+    expect(logOf(result.output)).toContain('Guessed "no idea" — wrong, the word was "piano".');
+  });
+
+  test("no event before the guess carries the secret, even from a model that explains itself", async () => {
+    // Every clue follows the rules; the mock still returns `reasoning` naming the secret.
+    const { executor } = createClueGivers({ Iris: ["keys"], Milo: ["Mozart"], Nadia: ["pedal"] });
+    const events: unknown[] = [];
+    const result = await runToQuiescence(
+      createAgentRuntime(justOneMachine, {
+        executors: { generateText: executor },
+        onTransition: (_snapshot, event) => events.push(event),
+      }),
+      { input: { rounds: 1, deck: ["piano"] } },
+    );
+    expect(result.status).toBe("idle");
+    // After the init event, which carries this test's own deck override as input.
+    const payloads = JSON.stringify(events.slice(1)).toLowerCase();
+    expect(payloads).toContain("mozart");
+    expect(payloads, payloads).not.toContain("piano");
+    expect(payloads).not.toContain("reasoning");
+  });
+
+  test("the final output states the log once, in the summary", async () => {
+    const { result } = await play({
+      input: { rounds: 1, deck: ["volcano"] },
+      script: { Iris: ["lava"], Milo: ["crater"], Nadia: ["Vesuvius"] },
+      guesserEvents: [{ type: "GUESS", guess: "volcano" }],
+    });
+    expect(Object.keys(result.output).sort()).toEqual(["rounds", "score", "summary"]);
+    expect(result.output.summary).toBe(
+      "Guessed 1 of 1 word.\n\n" +
+        'Round 1 — secret "volcano". Clues: lava (Iris), crater (Milo), Vesuvius (Nadia).\n' +
+        'Guessed "volcano" — correct.',
+    );
+  });
+
+  test("plurals collide with their singular, whatever the plural ending", () => {
+    const struck = (a: string, b: string) =>
+      judgeClues("honey", [{ clue: a }, { clue: b }, { clue: "Winnie" }]).map(
+        (clue) => clue.struck,
+      );
+    expect(struck("bee", "bees")).toEqual([true, true, false]);
+    expect(struck("box", "boxes")).toEqual([true, true, false]);
+    expect(struck("berry", "berries")).toEqual([true, true, false]);
+    expect(struck("glass", "glasses")).toEqual([true, true, false]);
+    expect(struck("bus", "buses")).toEqual([true, true, false]);
+    expect(struck("house", "houses")).toEqual([true, true, false]);
+    expect(struck("bee", "beehive")).toEqual([false, false, false]);
+  });
+
+  test("a typed guess may be a sentence, but must name the word whole", () => {
+    expect(isCorrectGuess("piano", "piano")).toBe(true);
+    expect(isCorrectGuess("Is it a piano?", "piano")).toBe(true);
+    expect(isCorrectGuess("pianos", "piano")).toBe(true);
+    expect(isCorrectGuess("pianist", "piano")).toBe(false);
+    expect(isCorrectGuess("a keyboard", "piano")).toBe(false);
+  });
+
+  test("PASS advances the round, and a mid-guess snapshot round-trips", async () => {
+    const { executor } = createClueGivers({
+      Iris: ["lava", "sting"],
+      Milo: ["crater", "bear"],
+      Nadia: ["Vesuvius", "bee"],
+    });
+    const shared = { executors: { generateText: executor } };
+
+    const firstIdle = await runToQuiescence(
+      createAgentRuntime(justOneMachine, {
+        ...shared,
+      }),
+      {
+        input: { rounds: 2, deck: ["volcano", "honey"] },
+        ...shared,
+      },
+    );
+    expect(firstIdle.status).toBe("idle");
+    if (firstIdle.status !== "idle") throw new Error("expected idle");
+    expect(idlePrompt(firstIdle.snapshot)).toBe(
+      "Clues: lava, crater, Vesuvius. What is the secret word?",
+    );
+
+    // Pass on round 1: no score, and the round advances.
+    const secondIdle = await runToQuiescence(
+      createAgentRuntime(justOneMachine, {
+        ...shared,
+      }),
+      {
+        snapshot: firstIdle.persist(),
+        event: { type: "PASS" },
+        ...shared,
+      },
+    );
+    expect(secondIdle.status).toBe("idle");
+    if (secondIdle.status !== "idle") throw new Error("expected idle");
+    expect(secondIdle.snapshot.context.score).toBe(0);
+    expect(idlePrompt(secondIdle.snapshot)).toBe(
+      "Clues: sting, bear, bee. What is the secret word?",
+    );
+
+    // Persist mid-guess as JSON, then resume a fresh run from it.
+    const serialized = JSON.stringify(secondIdle.persist());
+    const resumed = await runToQuiescence(
+      createAgentRuntime(justOneMachine, {
+        ...shared,
+      }),
+      {
+        snapshot: JSON.parse(serialized),
+        event: { type: "GUESS", guess: "Honey!" },
+        ...shared,
+      },
+    );
+
+    expect(resumed.status).toBe("done");
+    if (resumed.status !== "done") throw new Error("expected done");
+    expect(resumed.output.score).toBe(1);
+    expect(logOf(resumed.output)).toEqual([
+      'Round 1 — secret "volcano". Clues: lava (Iris), crater (Milo), Vesuvius (Nadia).',
+      'Passed — the word was "volcano".',
+      'Round 2 — secret "honey". Clues: sting (Iris), bear (Milo), bee (Nadia).',
+      'Guessed "Honey!" — correct.',
+    ]);
+  });
+
+  test("isolation: no clue request ever carries another giver's clue", async () => {
+    const captured: CapturedRequest[] = [];
+    const clues = {
+      Iris: ["lava", "sting"],
+      Milo: ["crater", "bear"],
+      Nadia: ["Vesuvius", "bee"],
+    };
+
+    await play({
+      input: { rounds: 2, deck: ["volcano", "honey"] },
+      script: clues,
+      guesserEvents: [
+        { type: "GUESS", guess: "volcano" },
+        { type: "GUESS", guess: "honey" },
+      ],
+      captured,
+    });
+
+    expect(captured).toHaveLength(6);
+    const allClues = Object.values(clues).flat();
+
+    for (const request of captured) {
+      expect(request.name).toBe("writeClue");
+      // The whole request — system, prompt, messages, everything — is checked:
+      // no clue text from ANY giver (including this one's other round) is in it.
+      for (const clue of allClues) {
+        expect(
+          request.serialized.toLowerCase().includes(clue.toLowerCase()),
+          `request leaked the clue "${clue}": ${request.prompt}`,
+        ).toBe(false);
+      }
+      // What it does carry: the secret word and exactly one persona.
+      expect(request.prompt).toMatch(/^Secret word: (volcano|honey)$/m);
+      const personasNamed = PERSONAS.filter((persona) =>
+        request.prompt?.includes(`You are ${persona.name}.`),
+      );
+      expect(personasNamed).toHaveLength(1);
+    }
+  });
+});

@@ -1,0 +1,364 @@
+import { readFileSync } from "node:fs";
+import { expect, test } from "vitest";
+import {
+  getInteraction,
+  getStatePath,
+  createAgentRuntime,
+  runToQuiescence,
+} from "@statelyai/agent";
+import { lintAgentMachine } from "@statelyai/agent/testing";
+import { createMockJudge, type MockJudgeEntry } from "../mock-judge.js";
+import { createMockModelExecutors } from "../mock-model.js";
+import {
+  MAX_CHECKPOINTS,
+  MAX_RETEACHES,
+  PASS_SCORE,
+  UNDERSTANDING_LEVELS,
+  createVerifyExplanation,
+  feynmanTutorMachine,
+  runFeynmanTutorExample,
+  stripNumbering,
+  type FeynmanHumanEvent,
+} from "./index.js";
+
+const checkpoints = [{ title: "Two keys" }, { title: "Signatures" }];
+const keyIdeas = [
+  "A public key encrypts; only the private key decrypts.",
+  "Signing with a private key proves who sent a message.",
+];
+
+const explain = (text: string): FeynmanHumanEvent => ({ type: "EXPLAIN", text });
+/** Judge `understanding` levels (0-4 → 0-100): 3 → 75 passes PASS_SCORE, 1 → 25 does not. */
+const pass = 3;
+const passScore = 75;
+const weak = 1;
+const weakScore = 25;
+
+/** The text model, mocked by request name; the grader is a mock judge, scripted separately. */
+function executors() {
+  return createMockModelExecutors({
+    text: {
+      planCheckpoints: [{ checkpoints }],
+      introduceCheckpoint: [{ context: "Here is why this matters." }],
+      distillKeyIdea: keyIdeas.map((keyIdea) => ({ keyIdea })),
+      explainSimply: [
+        { explanation: "Think of a mailbox: anyone can drop mail in, only you open it." },
+      ],
+    },
+  });
+}
+
+/** The grader's answers, in order; the last one repeats. */
+function grader(levels: MockJudgeEntry[]) {
+  return createMockJudge({ understanding: levels });
+}
+
+test("every explanation passes: one idle turn per checkpoint, then done", async () => {
+  const prompts: string[] = [];
+  const result = await runFeynmanTutorExample({
+    generateText: executors().generateText,
+    judge: grader([pass]).model,
+    humanEvents: [explain("public encrypts, private decrypts"), explain("signing proves identity")],
+    onPrompt: (label) => prompts.push(label),
+  });
+
+  expect(result.outcome).toBe("done");
+  expect(result).toMatchObject({ passed: 2, failed: 0, skipped: 0 });
+  expect(result.summary).toContain("2 of 2 checkpoint(s) passed");
+  expect(result.summary).toContain(`1. Two keys: passed (score ${passScore}/100)`);
+  expect(prompts).toHaveLength(2);
+  expect(prompts[0]).toContain("Checkpoint 1/2: Two keys");
+  expect(prompts[0]).toContain("Explain this back in your own words.");
+  expect(result.progress).toEqual([
+    "planningCheckpoints",
+    "presenting",
+    "awaitingExplanation",
+    "distilling",
+    "verifying",
+    "presenting",
+    "awaitingExplanation",
+    "distilling",
+    "verifying",
+    "done",
+  ]);
+});
+
+test("a weak explanation is re-taught, then passes", async () => {
+  const prompts: string[] = [];
+  const result = await runFeynmanTutorExample({
+    generateText: executors().generateText,
+    judge: grader([weak, pass]).model,
+    humanEvents: [
+      explain("private encrypts?"),
+      explain("public encrypts, private decrypts"),
+      explain("ok"),
+    ],
+    onPrompt: (label) => prompts.push(label),
+  });
+
+  expect(result.outcome).toBe("done");
+  expect(result.checkpoints[0]).toEqual({
+    title: "Two keys",
+    status: "passed",
+    score: passScore,
+    reteaches: 1,
+  });
+  // The second idle turn shows the re-teach, not the intro, and the feedback
+  // is the matched rubric level.
+  expect(prompts[1]).toContain(`Not yet (score ${weakScore}/100, need ${PASS_SCORE})`);
+  expect(prompts[1]).toContain(UNDERSTANDING_LEVELS[weak]);
+  expect(prompts[1]).toContain("mailbox");
+  // The answer key is distilled once per checkpoint: the retry reuses it.
+  expect(result.progress.slice(0, 8)).toEqual([
+    "planningCheckpoints",
+    "presenting",
+    "awaitingExplanation",
+    "distilling",
+    "verifying",
+    "teaching",
+    "awaitingExplanation",
+    "verifying",
+  ]);
+});
+
+test("reteach budget exhausted: the checkpoint fails and the session moves on", async () => {
+  const result = await runFeynmanTutorExample({
+    // Checkpoint 1 never passes; checkpoint 2 passes first time.
+    generateText: executors().generateText,
+    judge: grader([...Array.from({ length: MAX_RETEACHES + 1 }, () => weak), pass]).model,
+    humanEvents: Array.from({ length: MAX_RETEACHES + 2 }, () => explain("not sure")),
+  });
+
+  expect(result.outcome).toBe("done");
+  expect(result.checkpoints[0]).toMatchObject({
+    status: "failed",
+    score: weakScore,
+    reteaches: MAX_RETEACHES,
+  });
+  expect(result.checkpoints[1]).toMatchObject({ status: "passed" });
+  expect(result).toMatchObject({ passed: 1, failed: 1, skipped: 0 });
+  expect(result.progress.filter((state) => state === "teaching")).toHaveLength(MAX_RETEACHES);
+});
+
+test("SKIP records the checkpoint as skipped without scoring it", async () => {
+  const jev = grader([pass]);
+  const result = await runFeynmanTutorExample({
+    generateText: executors().generateText,
+    judge: jev.model,
+    humanEvents: [{ type: "SKIP" }, explain("signing proves identity")],
+  });
+
+  expect(result.checkpoints[0]).toEqual({
+    title: "Two keys",
+    status: "skipped",
+    score: null,
+    reteaches: 0,
+  });
+  expect(result).toMatchObject({ passed: 1, failed: 0, skipped: 1 });
+  expect(jev.calls).toHaveLength(1);
+});
+
+test("idle → persist() → resume round-trips through JSON", async () => {
+  const scripted = executors();
+  const actors = { verifyExplanation: createVerifyExplanation(grader([pass]).model) };
+  const first = await runToQuiescence(
+    createAgentRuntime(feynmanTutorMachine, {
+      executors: scripted,
+      actors,
+    }),
+    {
+      input: { topic: "RSA" },
+    },
+  );
+  expect(first.status).toBe("idle");
+  if (first.status !== "idle") return;
+  expect(getStatePath(first.snapshot)).toBe("awaitingExplanation");
+  const interaction = getInteraction(first.snapshot);
+  expect(interaction?.textEvent).toBe("EXPLAIN");
+  expect(interaction?.events.map((choice) => choice.type)).toEqual(["EXPLAIN", "SKIP"]);
+
+  const second = await runToQuiescence(
+    createAgentRuntime(feynmanTutorMachine, {
+      executors: scripted,
+      actors,
+    }),
+    {
+      snapshot: JSON.parse(JSON.stringify(first.persist())),
+      event: explain("public encrypts, private decrypts"),
+    },
+  );
+  expect(second.status).toBe("idle");
+  if (second.status !== "idle") return;
+  expect(second.snapshot.context.checkpointIndex).toBe(1);
+  expect(second.snapshot.context.results).toHaveLength(1);
+});
+
+test("no key idea is in context before the learner explains", async () => {
+  const scripted = executors();
+  const first = await runToQuiescence(
+    createAgentRuntime(feynmanTutorMachine, {
+      executors: scripted,
+      actors: { verifyExplanation: createVerifyExplanation(grader([weak]).model) },
+    }),
+    { input: { topic: "RSA" } },
+  );
+  if (first.status !== "idle") throw new Error("expected idle");
+  // A host renders changed context: the plan is titles only, the answer key unset.
+  expect(first.snapshot.context.checkpoints).toEqual(checkpoints);
+  expect(first.snapshot.context.keyIdea).toBeNull();
+  expect(JSON.stringify(first.snapshot.context)).not.toContain(keyIdeas[0]);
+  expect(scripted.calls.map((call) => call.name)).not.toContain("distillKeyIdea");
+
+  // The first explanation distills it from the intro the learner was shown.
+  const second = await runToQuiescence(
+    createAgentRuntime(feynmanTutorMachine, {
+      executors: scripted,
+      actors: { verifyExplanation: createVerifyExplanation(grader([weak]).model) },
+    }),
+    { snapshot: first.persist(), event: explain("private encrypts?") },
+  );
+  if (second.status !== "idle") throw new Error("expected idle");
+  expect(second.snapshot.context.keyIdea).toBe(keyIdeas[0]);
+  const distill = scripted.calls.find((call) => call.name === "distillKeyIdea")!;
+  expect(distill.input).toEqual({
+    title: "Two keys",
+    lesson: "Checkpoint 1/2: Two keys\n\nHere is why this matters.",
+  });
+});
+
+test("planner caps checkpoints at MAX_CHECKPOINTS; zero checkpoints ends in failed", async () => {
+  const many = Array.from({ length: MAX_CHECKPOINTS + 2 }, (_, i) => ({ title: `C${i}` }));
+  const capped = await runFeynmanTutorExample({
+    generateText: createMockModelExecutors({
+      text: {
+        planCheckpoints: [{ checkpoints: many }],
+        introduceCheckpoint: [{ context: "intro" }],
+        distillKeyIdea: [{ keyIdea: "x" }],
+      },
+    }).generateText,
+    judge: grader([pass]).model,
+    humanEvents: Array.from({ length: MAX_CHECKPOINTS }, () => explain("x")),
+  });
+  expect(capped.checkpoints).toHaveLength(MAX_CHECKPOINTS);
+
+  const empty = await runFeynmanTutorExample({
+    generateText: createMockModelExecutors({ text: { planCheckpoints: [{ checkpoints: [] }] } })
+      .generateText,
+  });
+  expect(empty.outcome).toBe("failed");
+  expect(empty.summary).toContain("no checkpoints");
+});
+
+test("numbered planner titles are stripped; the machine numbers checkpoints itself", async () => {
+  expect(stripNumbering("1. Two keys")).toBe("Two keys");
+  expect(stripNumbering("Step 2: Signatures")).toBe("Signatures");
+  expect(stripNumbering("3) Hashes")).toBe("Hashes");
+  expect(stripNumbering("RSA in 3 steps")).toBe("RSA in 3 steps");
+  expect(stripNumbering("2048-bit keys")).toBe("2048-bit keys");
+
+  const numbered = checkpoints.map((checkpoint, i) => ({
+    ...checkpoint,
+    title: `${i + 1}. ${checkpoint.title}`,
+  }));
+  const result = await runFeynmanTutorExample({
+    generateText: createMockModelExecutors({
+      text: {
+        planCheckpoints: [{ checkpoints: numbered }],
+        introduceCheckpoint: [{ context: "intro" }],
+        distillKeyIdea: [{ keyIdea: "x" }],
+      },
+    }).generateText,
+    judge: grader([pass]).model,
+    humanEvents: [explain("x"), explain("y")],
+  });
+  expect(result.checkpoints.map((checkpoint) => checkpoint.title)).toEqual([
+    "Two keys",
+    "Signatures",
+  ]);
+});
+
+test("a model error lands in failed with the checkpoints finished so far", async () => {
+  const result = await runFeynmanTutorExample({
+    generateText: createMockModelExecutors({
+      text: {
+        planCheckpoints: [{ checkpoints }],
+        introduceCheckpoint: [{ context: "intro" }],
+        distillKeyIdea: [{ keyIdea: "x" }],
+      },
+    }).generateText,
+    judge: grader([
+      pass,
+      () => {
+        throw new Error("provider down");
+      },
+    ]).model,
+    humanEvents: [explain("a"), explain("b")],
+  });
+  expect(result.outcome).toBe("failed");
+  expect(result.summary).toContain("verifyExplanation failed");
+  expect(result.passed).toBe(1);
+});
+
+test("starters behave as their labels advertise", async () => {
+  const starters = JSON.parse(readFileSync(new URL("./metadata.json", import.meta.url), "utf8"))
+    .starters as string[];
+  expect(starters.length).toBeGreaterThanOrEqual(2);
+  for (const topic of starters) {
+    const scripted = executors();
+    const result = await runFeynmanTutorExample({
+      topic,
+      generateText: scripted.generateText,
+      judge: grader([pass]).model,
+      humanEvents: [explain("a"), explain("b")],
+    });
+    // Each starter is the topic the planner sees; the session asks before scoring.
+    expect((scripted.calls[0]!.input as { topic: string }).topic).toBe(topic);
+    expect(result.progress[2]).toBe("awaitingExplanation");
+    expect(result.outcome).toBe("done");
+  }
+});
+
+test("verifying asks Jev one five-level score over the checkpoint, and PASS_SCORE splits the levels", async () => {
+  // Level 2 maps to 50/100, under PASS_SCORE; level 3 maps to 75/100, over it.
+  const jev = grader([2, 3]);
+  const result = await runFeynmanTutorExample({
+    generateText: executors().generateText,
+    judge: jev.model,
+    humanEvents: [
+      explain("private decrypts"),
+      explain("public encrypts, private decrypts"),
+      explain("signing proves identity"),
+    ],
+  });
+
+  const call = jev.calls[0]!;
+  expect(call.state).toEqual({
+    checkpoint: "Two keys",
+    keyIdea: keyIdeas[0],
+    explanation: "private decrypts",
+  });
+  expect(Object.keys(call.questions)).toEqual(["understanding"]);
+  const question = call.questions.understanding!;
+  expect(question.type).toBe("score");
+  expect(question.type === "score" && question.criteria).toEqual([...UNDERSTANDING_LEVELS]);
+  expect(result.progress.slice(4, 6)).toEqual(["verifying", "teaching"]);
+  expect(result.checkpoints[0]).toMatchObject({ status: "passed", score: 75, reteaches: 1 });
+});
+
+test('the intro and re-teach speak to the learner as "you", not in the third person', async () => {
+  const scripted = executors();
+  await runFeynmanTutorExample({
+    generateText: scripted.generateText,
+    judge: grader([weak, pass]).model,
+    humanEvents: [explain("private encrypts?"), explain("a"), explain("b")],
+  });
+  for (const name of ["introduceCheckpoint", "explainSimply"]) {
+    const system = scripted.calls.find((call) => call.name === name)!.request.system ?? "";
+    expect(system).toContain('as "you"');
+    expect(system).not.toMatch(/what the learner should/);
+  }
+});
+
+test("lintAgentMachine is clean", () => {
+  expect(() => lintAgentMachine(feynmanTutorMachine, { throw: true })).not.toThrow();
+});
